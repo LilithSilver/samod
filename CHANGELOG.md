@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.12.3 - 2026-07-09
+
+### Fixed
+
+* `FileSystemStorage` no longer panics if the filesystem is not shaped the way
+  it expects.
+
+## 0.12.2 - 2026-07-08
+
+### Added
+
+* Added `DocHandle::with_document_async` which does two things:
+  a) Does not block the current task waiting to acquire the underlying document
+    mutex
+  b) In threadpool mode runs the closure on the threadpool so that slow
+     automerge operations don't block the calling task
+
+## 0.12.1 - 2026-06-22
+
+### Changed
+
+* `DocHandle::{changes, ephemeral}` now return streams with a `'static`
+   lifetime
+
 > [!NOTE]
 > This is the changelog for the `samod` crate. For the `samod-core` crate look
 > in `./samod-core/CHANGELOG.md`
