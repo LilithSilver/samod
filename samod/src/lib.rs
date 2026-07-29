@@ -299,7 +299,7 @@ use futures::{
 use rand::SeedableRng;
 pub use samod_core::{
     AutomergeUrl, BackoffConfig, ConnectionId, DialerId, DocSearch, DocumentId, ListenerId, PeerId,
-    PeerRequestState, StorageId, network::ConnDirection,
+    PeerRequestState, StorageId, network::ConnDirection, BadDocumentId
 };
 use samod_core::{
     CommandId, CommandResult, DocumentActorId, LoaderState, UnixTimestamp,
