@@ -19,10 +19,12 @@ pub fn key_to_path(key: &samod_core::StorageKey) -> std::path::PathBuf {
 pub mod tokio {
     use std::{
         collections::HashMap,
-        path::{Path, PathBuf},
+        path::{Path, PathBuf}, sync::Arc,
     };
 
-    use crate::storage::Storage;
+    use tokio::sync::Semaphore;
+
+use crate::storage::Storage;
 
     use super::key_to_path;
 
@@ -32,12 +34,14 @@ pub mod tokio {
     #[derive(Clone, Debug)]
     pub struct FilesystemStorage {
         data_dir: PathBuf,
+        read_limit: Arc<Semaphore>
     }
 
     impl FilesystemStorage {
         pub fn new<P: AsRef<Path>>(data_dir: P) -> Self {
             Self {
                 data_dir: data_dir.as_ref().to_path_buf(),
+                read_limit: Arc::new(Semaphore::new(500))
             }
         }
 
@@ -80,6 +84,7 @@ pub mod tokio {
                 // Now walk the directory, recursively
                 let mut to_visit = vec![(path, prefix)];
                 while let Some((next_path, key_prefix)) = to_visit.pop() {
+                    let permit = self.read_limit.acquire().await;
                     let Ok(mut entries) = tokio::fs::read_dir(&next_path).await else {
                         continue;
                     };
@@ -109,6 +114,7 @@ pub mod tokio {
                             result.insert(next_key_prefix, data);
                         }
                     }
+                    drop(permit);
                 }
                 result
             }
