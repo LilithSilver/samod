@@ -3,8 +3,13 @@ use std::collections::HashMap;
 use automerge::ChangeHash;
 
 use crate::{
-    ConnectionId, DocumentChanged, PeerId, StorageKey,
-    actors::{DocToHubMsg, document::io::DocumentIoTask, messages::DocToHubMsgPayload},
+    ConnectionId, DocumentChanged, DocumentId, PeerId, StorageKey,
+    actors::{
+        DocToHubMsg,
+        document::{SyncMessageStat, io::DocumentIoTask},
+        messages::{Broadcast, DocToHubMsgPayload, SyncMessage},
+    },
+    doc_search::DocSearchPhase,
     io::{IoTask, IoTaskId, StorageTask},
     network::PeerDocState,
 };
@@ -24,6 +29,10 @@ pub struct DocActorResult {
     pub stopped: bool,
     /// Connections which have changed state for this document
     pub peer_state_changes: HashMap<ConnectionId, PeerDocState>,
+    /// Sync message statistics for observability
+    pub sync_message_stats: Vec<SyncMessageStat>,
+    /// Number of pending sync messages queued during Loading phase
+    pub pending_sync_messages: usize,
 }
 
 impl DocActorResult {
@@ -36,6 +45,8 @@ impl DocActorResult {
             change_events: Vec::new(),
             stopped: false,
             peer_state_changes: HashMap::new(),
+            sync_message_stats: Vec::new(),
+            pending_sync_messages: 0,
         }
     }
 
@@ -48,8 +59,53 @@ impl DocActorResult {
     }
 
     /// Send a message back to the hub
-    pub(crate) fn send_message(&mut self, message: DocToHubMsgPayload) {
-        self.outgoing_messages.push(DocToHubMsg(message));
+    pub(crate) fn send_sync_message(
+        &mut self,
+        conn_id: ConnectionId,
+        doc_id: DocumentId,
+        message: SyncMessage,
+    ) {
+        self.outgoing_messages
+            .push(DocToHubMsg(DocToHubMsgPayload::SendSyncMessage {
+                connection_id: conn_id,
+                document_id: doc_id,
+                message,
+            }));
+    }
+
+    pub(crate) fn send_broadcast(&mut self, connections: Vec<ConnectionId>, msg: Broadcast) {
+        self.outgoing_messages
+            .push(DocToHubMsg(DocToHubMsgPayload::Broadcast {
+                connections,
+                msg,
+            }));
+    }
+
+    pub(crate) fn send_terminated(&mut self) {
+        self.outgoing_messages
+            .push(DocToHubMsg(DocToHubMsgPayload::Terminated));
+    }
+
+    pub(crate) fn update_search_state(&mut self, new_search_state: DocSearchPhase) {
+        self.outgoing_messages
+            .retain(|msg| !matches!(msg.0, DocToHubMsgPayload::DocSearchChanged(_)));
+        self.outgoing_messages
+            .push(DocToHubMsg(DocToHubMsgPayload::DocSearchChanged(
+                new_search_state,
+            )));
+    }
+
+    pub(crate) fn emit_peer_state_changes(
+        &mut self,
+        new_states: HashMap<ConnectionId, PeerDocState>,
+    ) {
+        self.outgoing_messages
+            .retain(|msg| !matches!(msg.0, DocToHubMsgPayload::PeerStatesChanged(_)));
+        self.outgoing_messages
+            .push(DocToHubMsg(DocToHubMsgPayload::PeerStatesChanged(
+                new_states.clone(),
+            )));
+        self.peer_state_changes = new_states;
     }
 
     pub(crate) fn put(&mut self, key: StorageKey, value: Vec<u8>) -> IoTaskId {

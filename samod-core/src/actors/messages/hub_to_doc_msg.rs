@@ -1,4 +1,4 @@
-use crate::ConnectionId;
+use crate::{ConnectionId, UnixTimestamp};
 
 use super::DocMessage;
 
@@ -16,15 +16,12 @@ pub(crate) enum HubToDocMsgPayload {
         peer_id: crate::PeerId,
     },
 
-    RequestAgain,
-
     /// Notify the actor that a connection has been closed.
-    ConnectionClosed {
-        connection_id: crate::ConnectionId,
-    },
+    ConnectionClosed { connection_id: crate::ConnectionId },
 
     HandleDocMessage {
         connection_id: ConnectionId,
         message: DocMessage,
+        received_at: UnixTimestamp,
     },
 }

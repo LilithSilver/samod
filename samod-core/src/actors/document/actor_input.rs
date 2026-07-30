@@ -1,4 +1,5 @@
 use crate::{
+    UnixTimestamp,
     actors::{
         document::io::DocumentIoResult,
         messages::{DocMessage, HubToDocMsgPayload},
@@ -17,6 +18,7 @@ pub(crate) enum ActorInput {
     HandleDocMessage {
         connection_id: crate::ConnectionId,
         message: DocMessage,
+        received_at: UnixTimestamp,
     },
     NewConnection {
         connection_id: crate::ConnectionId,
@@ -26,7 +28,6 @@ pub(crate) enum ActorInput {
         connection_id: crate::ConnectionId,
     },
     IoComplete(IoResult<DocumentIoResult>),
-    Request,
     Tick,
 }
 
@@ -38,9 +39,11 @@ impl From<HubToDocMsgPayload> for ActorInput {
             HubToDocMsgPayload::HandleDocMessage {
                 connection_id,
                 message,
+                received_at,
             } => ActorInput::HandleDocMessage {
                 connection_id,
                 message,
+                received_at,
             },
             HubToDocMsgPayload::NewConnection {
                 connection_id,
@@ -52,7 +55,6 @@ impl From<HubToDocMsgPayload> for ActorInput {
             HubToDocMsgPayload::ConnectionClosed { connection_id } => {
                 ActorInput::ConnectionClosed { connection_id }
             }
-            HubToDocMsgPayload::RequestAgain => ActorInput::Request,
         }
     }
 }

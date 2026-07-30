@@ -2,16 +2,33 @@ use std::{io::IsTerminal, path::PathBuf};
 
 use futures::{Stream, StreamExt};
 use samod::DocumentId;
-use tokio::{io::AsyncBufReadExt, process::Command};
+use tokio::{io::AsyncBufReadExt, process::Command, sync::OnceCell};
+
+impl RunningJsServer {
+    /// Query the JS server's storage keys via its /storage-keys HTTP endpoint.
+    pub(super) async fn storage_keys(&self) -> eyre::Result<Vec<Vec<String>>> {
+        let url = format!("http://localhost:{}/storage-keys", self.port);
+        let resp = reqwest::get(&url).await?;
+        let keys: Vec<Vec<String>> = resp.json().await?;
+        Ok(keys)
+    }
+}
 
 const INTEROP_SERVER_PATH: &str = "interop-test-server";
+
+static JS_DEPS_INITIALIZED: OnceCell<Result<(), String>> = OnceCell::const_new();
 
 pub(super) struct JsWrapper;
 
 impl JsWrapper {
     pub(super) async fn create() -> eyre::Result<Self> {
-        ensure_js_deps().await?;
-        Ok(Self)
+        let result = JS_DEPS_INITIALIZED
+            .get_or_init(|| async { ensure_js_deps().await.map_err(|e| e.to_string()) })
+            .await;
+        match result {
+            Ok(()) => Ok(Self),
+            Err(e) => Err(eyre::eyre!("{}", e)),
+        }
     }
 
     pub(super) async fn start_server(&self) -> eyre::Result<RunningJsServer> {
@@ -131,6 +148,113 @@ impl JsWrapper {
         proc.child.kill().await?;
 
         Ok(hashes)
+    }
+
+    /// Runs `node client.js subscribe-and-create <port> <storageId>` and returns the doc id and heads.
+    ///
+    /// This creates a JS client with remote heads gossiping enabled that subscribes to the given
+    /// storage ID, triggering a `remote-subscription-change` message with only an `add` field
+    /// (no `remove`) to be sent to the server.
+    pub(super) async fn subscribe_and_create_doc(
+        &self,
+        port: u16,
+        storage_id: &str,
+    ) -> eyre::Result<(DocumentId, Vec<automerge::ChangeHash>, JsProcess)> {
+        let mut proc = run_in_js_project(
+            tokio::process::Command::new("node")
+                .args([
+                    "client.js",
+                    "subscribe-and-create",
+                    &port.to_string(),
+                    storage_id,
+                ])
+                .env("DEBUG", "WebsocketClient,automerge-repo:*")
+                .kill_on_drop(true),
+            "js subscribe-and-create",
+        )
+        .await?;
+
+        let line = proc
+            .stdout
+            .as_mut()
+            .unwrap()
+            .next()
+            .await
+            .ok_or_else(|| eyre::eyre!("No first line from JS client"))?
+            .map_err(|e| eyre::eyre!("Error reading from JS client stdout: {}", e))?;
+        let doc_id = parse_doc_url(line)
+            .map_err(|e| eyre::eyre!("Error parsing doc id from JS client: {}", e))?;
+
+        let line = proc
+            .stdout
+            .as_mut()
+            .unwrap()
+            .next()
+            .await
+            .ok_or_else(|| eyre::eyre!("No second line from JS client"))?
+            .map_err(|e| eyre::eyre!("Error reading from JS client stdout: {}", e))?;
+        let hashes = line
+            .split(",")
+            .map(|s| s.parse::<automerge::ChangeHash>())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| eyre::eyre!("Error parsing heads from JS client: {}", e))?;
+
+        proc.forward_stdout();
+
+        Ok((doc_id, hashes, proc))
+    }
+
+    /// Creates a JS client that first syncs a doc through a JS server (which has a storage ID),
+    /// then connects to a second server. When the second server becomes a "generous peer", the
+    /// JS client sends a `remote-heads-changed` message containing a `Date.now()` timestamp
+    /// (encoded as CBOR float64 by cbor-x).
+    pub(super) async fn create_and_relay_heads(
+        &self,
+        js_server_port: u16,
+        rust_server_port: u16,
+    ) -> eyre::Result<(DocumentId, Vec<automerge::ChangeHash>, JsProcess)> {
+        let mut proc = run_in_js_project(
+            tokio::process::Command::new("node")
+                .args([
+                    "client.js",
+                    "create-and-relay-heads",
+                    &js_server_port.to_string(),
+                    &rust_server_port.to_string(),
+                ])
+                .env("DEBUG", "WebsocketClient,automerge-repo:*")
+                .kill_on_drop(true),
+            "js create-and-relay-heads",
+        )
+        .await?;
+
+        let line = proc
+            .stdout
+            .as_mut()
+            .unwrap()
+            .next()
+            .await
+            .ok_or_else(|| eyre::eyre!("No first line from JS client"))?
+            .map_err(|e| eyre::eyre!("Error reading from JS client stdout: {}", e))?;
+        let doc_id = parse_doc_url(line)
+            .map_err(|e| eyre::eyre!("Error parsing doc id from JS client: {}", e))?;
+
+        let line = proc
+            .stdout
+            .as_mut()
+            .unwrap()
+            .next()
+            .await
+            .ok_or_else(|| eyre::eyre!("No second line from JS client"))?
+            .map_err(|e| eyre::eyre!("Error reading from JS client stdout: {}", e))?;
+        let hashes = line
+            .split(",")
+            .map(|s| s.parse::<automerge::ChangeHash>())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| eyre::eyre!("Error parsing heads from JS client: {}", e))?;
+
+        proc.forward_stdout();
+
+        Ok((doc_id, hashes, proc))
     }
 
     pub(super) async fn send_ephemeral_message(

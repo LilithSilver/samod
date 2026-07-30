@@ -1,6 +1,6 @@
 [package]
 name = "samod"
-version = "0.6.1"
+version = "0.12.3"
 edition = "2024"
 authors = ["Alex Good <alex@patternist.xyz>"]
 description = "A rust library for managing automerge documents, compatible with the js automerge-repo library"
@@ -10,7 +10,7 @@ repository = "https://github.com/alexjg/samod"
 [features]
 tokio = ["dep:tokio", "dep:tokio-util"]
 axum = ["dep:axum", "dep:tokio", "dep:tokio-util"]
-tungstenite = ["dep:tungstenite", "dep:tokio-tungstenite", "tokio"]
+tungstenite = ["dep:tungstenite", "dep:tokio-tungstenite", "tokio", "tungstenite/native-tls", "tokio-tungstenite/native-tls"]
 gio = ["dep:gio", "dep:glib"]
 threadpool = ["dep:rayon"]
 
@@ -20,24 +20,27 @@ axum = { version = "0.8.4", optional = true, features = ["ws"] }
 bytes = "1.10.1"
 chrono = "0.4.41"
 futures = "0.3.31"
-rand = "0.9.2"
+futures-timer = "3.0.3"
+rand = "0.10.2"
 rayon = { version = "1.10.0", optional = true }
-samod-core = { path = "../samod-core", version = "0.6.1" }
+samod-core = { path = "../samod-core", version = "0.12.2" }
 tokio = { version = "1.46.0", features = ["rt", "time", "fs"], optional = true }
-tokio-tungstenite = { version = "0.28.0", optional = true }
+tokio-tungstenite = { version = "0.30.0", optional = true }
 tokio-util = { version = "0.7.15", features = [
     "codec",
     "net",
 ], optional = true }
 tracing = "0.1.41"
-tungstenite = { version = "0.28.0", optional = true }
-gio = { version = "0.20.12", optional = true }
-glib = { version = "0.20.12", optional = true }
+url = "2.5"
+tungstenite = { version = "0.30.0", optional = true }
+gio = { version = "0.22.8", optional = true }
+glib = { version = "0.22.8", optional = true }
 async-channel = "2.5.0"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 
 [dev-dependencies]
 eyre = "0.6.12"
-reqwest = { version = "0.12.22", features = [
+reqwest = { version = "0.13.4", features = [
     "json",
     "blocking",
 ], default-features = false }

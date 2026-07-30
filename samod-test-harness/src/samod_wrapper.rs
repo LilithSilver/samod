@@ -6,8 +6,8 @@ use std::{
 use automerge::Automerge;
 use rand::SeedableRng;
 use samod_core::{
-    CommandId, CommandResult, ConnectionId, DocumentActorId, DocumentChanged, DocumentId, PeerId,
-    StorageId, StorageKey, UnixTimestamp,
+    CommandId, CommandResult, ConnectionId, DialerId, DocSearch, DocumentActorId, DocumentChanged,
+    DocumentId, ListenerId, PeerId, StorageId, StorageKey, UnixTimestamp,
     actors::{
         DocumentActor, DocumentError,
         hub::{
@@ -16,7 +16,7 @@ use samod_core::{
         },
     },
     io::{IoResult, IoTask},
-    network::{ConnDirection, ConnectionEvent, ConnectionInfo, PeerDocState},
+    network::{ConnectionEvent, ConnectionInfo, DialerConfig, ListenerConfig, PeerDocState},
 };
 
 use crate::{Storage, doc_actor_runner::DocActorRunner};
@@ -39,6 +39,12 @@ pub struct SamodWrapper {
     // Connection events captured during event processing
     connection_events: Vec<ConnectionEvent>,
     announce_policy: Box<dyn Fn(DocumentId, PeerId) -> bool>,
+    /// A test listener ID used for incoming connections.
+    test_listener_id: Option<ListenerId>,
+    /// Track the latest `DocSearch` per document as emitted by the hub.
+    /// The wrapper builds these from document actor status + dialer state,
+    /// exactly as a real wrapper would build them from the search stream.
+    latest_search_states: HashMap<DocumentId, DocSearch>,
 }
 
 impl SamodWrapper {
@@ -58,7 +64,10 @@ impl SamodWrapper {
             match loader.step(&mut rng, now) {
                 samod_core::LoaderState::NeedIo(tasks) => {
                     for task in tasks {
-                        let result = storage.handle_task(task.action);
+                        storage.handle_task(task.task_id, task.action);
+                        let result = storage
+                            .check_pending_task(task.task_id)
+                            .expect("storage should not be paused");
                         loader.provide_io_result(IoResult {
                             task_id: task.task_id,
                             payload: result,
@@ -79,18 +88,75 @@ impl SamodWrapper {
             document_actors: HashMap::new(),
             connection_events: Vec::new(),
             announce_policy: Box::new(|_, _| true),
+            test_listener_id: None,
+            latest_search_states: HashMap::new(),
         }
     }
 
+    pub fn pause_storage(&mut self) {
+        self.storage.pause();
+    }
+
+    pub fn resume_storage(&mut self) {
+        self.storage.resume();
+    }
+
+    /// Register a new dialer in the hub (for connector tests).
+    pub fn add_dialer(&mut self, config: DialerConfig) -> DialerId {
+        let DispatchedCommand { command_id, event } = HubEvent::add_dialer(config);
+        self.inbox.push_back(event);
+        self.handle_events();
+        let result = self
+            .completed_commands
+            .remove(&command_id)
+            .expect("add_dialer should complete immediately");
+        match result {
+            CommandResult::AddDialer { dialer_id } => dialer_id,
+            other => panic!("unexpected result for add_dialer: {other:?}"),
+        }
+    }
+
+    /// Register a new listener in the hub (for connector tests).
+    pub fn add_listener(&mut self, config: ListenerConfig) -> ListenerId {
+        let DispatchedCommand { command_id, event } = HubEvent::add_listener(config);
+        self.inbox.push_back(event);
+        self.handle_events();
+        let result = self
+            .completed_commands
+            .remove(&command_id)
+            .expect("add_listener should complete immediately");
+        match result {
+            CommandResult::AddListener { listener_id } => listener_id,
+            other => panic!("unexpected result for add_listener: {other:?}"),
+        }
+    }
+
+    /// Create an outgoing test connection via a fresh dialer.
     pub fn create_connection(&mut self) -> samod_core::ConnectionId {
-        let DispatchedCommand { command_id, event } =
-            HubEvent::create_connection(ConnDirection::Outgoing);
+        // Create a unique url for each dialer to avoid conflicts in the hug
+        let rand_id = rand::random::<u64>();
+        let url = url::Url::parse(&format!("test://dialer/{}", rand_id)).unwrap();
+
+        let dialer_id = self.add_dialer(DialerConfig {
+            url,
+            backoff: samod_core::BackoffConfig {
+                initial_delay: Duration::from_secs(999),
+                max_delay: Duration::from_secs(999),
+                max_retries: None,
+            },
+        });
+        self.create_dialer_connection(dialer_id)
+    }
+
+    /// Create a connection for a specific dialer.
+    pub fn create_dialer_connection(&mut self, dialer_id: DialerId) -> samod_core::ConnectionId {
+        let DispatchedCommand { command_id, event } = HubEvent::create_dialer_connection(dialer_id);
         self.inbox.push_back(event);
         self.handle_events();
         let completed_command = self
             .completed_commands
             .remove(&command_id)
-            .expect("The create connection command never completed");
+            .expect("The create dialer connection command never completed");
         match completed_command {
             CommandResult::CreateConnection { connection_id, .. } => connection_id,
             _ => {
@@ -99,9 +165,27 @@ impl SamodWrapper {
         }
     }
 
+    /// Create an incoming test connection via a shared listener.
     pub fn create_incoming_connection(&mut self) -> samod_core::ConnectionId {
+        // Create a unique url for each listener to avoid conflicts in the hug
+        let rand_id = rand::random::<u64>();
+        let url = url::Url::parse(&format!("test://dialer/{}", rand_id)).unwrap();
+
+        // Ensure we have a test listener
+        if self.test_listener_id.is_none() {
+            self.test_listener_id = Some(self.add_listener(ListenerConfig { url }));
+        }
+        let listener_id = self.test_listener_id.unwrap();
+        self.create_listener_connection(listener_id)
+    }
+
+    /// Create a connection for a specific listener.
+    pub fn create_listener_connection(
+        &mut self,
+        listener_id: ListenerId,
+    ) -> samod_core::ConnectionId {
         let DispatchedCommand { command_id, event } =
-            HubEvent::create_connection(ConnDirection::Incoming);
+            HubEvent::create_listener_connection(listener_id);
         self.inbox.push_back(event);
         self.handle_events();
         let completed_command = self
@@ -166,24 +250,24 @@ impl SamodWrapper {
         }
     }
 
-    pub fn start_find_document(&mut self, document_id: &DocumentId) -> CommandId {
-        let DispatchedCommand { command_id, event } = HubEvent::find_document(document_id.clone());
+    pub fn start_search_document(&mut self, document_id: &DocumentId) -> CommandId {
+        let DispatchedCommand { command_id, event } = HubEvent::search_for_doc(document_id.clone());
         self.inbox.push_back(event);
-        self.handle_events();
         command_id
     }
 
-    pub fn check_find_document_result(
+    pub fn check_search_document_result(
         &mut self,
         command_id: CommandId,
-    ) -> Option<Option<DocumentActorId>> {
+    ) -> Option<DocumentActorId> {
         if let Some(completed_command) = self.completed_commands.remove(&command_id) {
             match completed_command {
-                CommandResult::FindDocument { found, actor_id } => {
-                    Some(if found { Some(actor_id) } else { None })
-                }
+                CommandResult::SearchForDoc {
+                    actor_id,
+                    search_state: _,
+                } => Some(actor_id),
                 _ => {
-                    panic!("Expected a FindDocument command result, but got {completed_command:?}")
+                    panic!("Expected a SearchForDoc command result, but got {completed_command:?}")
                 }
             }
         } else {
@@ -220,6 +304,13 @@ impl SamodWrapper {
             // Capture connection events
             for event in results.connection_events {
                 self.connection_events.push(event);
+            }
+
+            // Build DocSearch snapshots for documents whose state changed.
+            // The hub already built the DocSearch from document actor status +
+            // peer request states + dialer info.
+            for (doc_id, state) in results.search_state_updates {
+                self.latest_search_states.insert(doc_id, state);
             }
 
             // Handle IO tasks
@@ -292,15 +383,30 @@ impl SamodWrapper {
     }
 
     pub fn storage(&self) -> &HashMap<StorageKey, Vec<u8>> {
-        &self.storage.0
-    }
-
-    pub fn storage_mut(&mut self) -> &mut HashMap<StorageKey, Vec<u8>> {
-        &mut self.storage.0
+        self.storage.data()
     }
 
     pub fn push_event(&mut self, event: HubEvent) {
         self.inbox.push_back(event);
+    }
+
+    /// Notify the hub that a dial attempt failed for a dialer.
+    pub fn dial_failed(&mut self, dialer_id: DialerId, error: String) {
+        self.inbox
+            .push_back(HubEvent::dial_failed(dialer_id, error));
+        self.handle_events();
+    }
+
+    /// Send a tick event to the hub (drives retry timers, etc.).
+    pub fn tick(&mut self) {
+        self.inbox.push_back(HubEvent::tick());
+        self.handle_events();
+    }
+
+    /// Remove a dialer from the hub.
+    pub fn remove_dialer(&mut self, dialer_id: DialerId) {
+        self.inbox.push_back(HubEvent::remove_dialer(dialer_id));
+        self.handle_events();
     }
 
     /// Returns the number of active document actors
@@ -323,7 +429,23 @@ impl SamodWrapper {
         self.document_actors
             .values()
             .find(|d| d.document_id() == doc_id)
-            .map(|d| d.actor().document())
+            .and_then(|d| {
+                if d.actor().is_document_ready() {
+                    Some(d.actor().document())
+                } else {
+                    None
+                }
+            })
+    }
+
+    /// Check if a document is available (has content).
+    ///
+    /// Returns true only if the document exists and has at least one change.
+    pub fn is_document_available(&self, doc_id: &DocumentId) -> bool {
+        match self.document(doc_id) {
+            Some(doc) => !doc.get_heads().is_empty(),
+            None => false,
+        }
     }
 
     pub fn with_document<F, R>(&mut self, doc_id: &DocumentId, f: F) -> Result<R, DocumentError>
@@ -338,6 +460,13 @@ impl SamodWrapper {
         let result = actor.with_document(self.now, f);
         self.handle_events();
         result
+    }
+
+    pub fn is_document_available_by_actor(&self, actor_id: DocumentActorId) -> bool {
+        self.document_actors
+            .get(&actor_id)
+            .map(|runner| !runner.actor().document().get_heads().is_empty())
+            .unwrap_or(false)
     }
 
     pub fn with_document_by_actor<F, R>(
@@ -444,7 +573,7 @@ impl SamodWrapper {
         runner.actor().peers()
     }
 
-    pub fn peer_state_changes(
+    pub fn peer_doc_state_changes(
         &self,
         doc_id: &DocumentId,
     ) -> &[HashMap<ConnectionId, PeerDocState>] {
@@ -456,5 +585,9 @@ impl SamodWrapper {
             return &[];
         };
         runner.peer_doc_state_changes()
+    }
+
+    pub fn search_status(&self, doc_id: &DocumentId) -> Option<&DocSearch> {
+        self.latest_search_states.get(doc_id)
     }
 }

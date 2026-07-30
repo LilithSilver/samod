@@ -179,7 +179,9 @@
 //!
 //! Network connections are assumed to be stream oriented and are represented by
 //! the [`ConnectionId`] type. You obtain a connection by passing a
-//! [`HubEvent::create_connection`](crate::actors::hub::HubEvent::create_connection)
+//! [`HubEvent::create_dialer_connection`](crate::actors::hub::HubEvent::create_dialer_connection)
+//! or
+//! [`HubEvent::create_listener_connection`](crate::actors::hub::HubEvent::create_listener_connection)
 //! to the [`Hub`](crate::actors::hub::Hub) and waiting for the create command
 //! to complete, returning a [`ConnectionId`]. Messages can now be passed to the
 //! hub using [`HubEvent::receive`](crate::actors::hub::HubEvent::receive) and
@@ -199,9 +201,13 @@ mod document_id;
 mod ephemera;
 pub mod network;
 pub use network::ConnectionId;
+pub use network::{
+    BackoffConfig, ConnectionOwner, DialRequest, DialerConfig, DialerEvent, DialerId,
+    ListenerConfig, ListenerId,
+};
 mod peer_id;
 
-pub use actors::document::{CompactionHash, DocumentActorId};
+pub use actors::document::{CompactionHash, DocumentActorId, SyncDirection, SyncMessageStat};
 pub use document_changed::DocumentChanged;
 pub use document_id::{BadDocumentId, DocumentId};
 pub mod io;
@@ -215,3 +221,5 @@ pub use unix_timestamp::UnixTimestamp;
 
 mod loader;
 pub use loader::{LoaderState, SamodLoader};
+mod doc_search;
+pub use doc_search::{DocSearch, DocSearchPhase, PeerRequestState};

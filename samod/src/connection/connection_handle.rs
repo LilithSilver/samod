@@ -4,7 +4,7 @@ use futures::channel::oneshot;
 use samod_core::ConnectionId;
 
 use crate::{
-    ConnFinishedReason, PeerInfo,
+    AcceptorEvent, ConnFinishedReason, PeerInfo,
     unbounded::{self, UnboundedReceiver, UnboundedSender},
 };
 
@@ -13,6 +13,7 @@ use crate::{
 // * The Repo::inner struct
 // * The io loop
 // * Instances of `crate::Connection` which are the public API
+// * Provided publicly via the various `accept()` methods
 //
 // The connection handle is created as in Inner::handle_event as soon as a
 // `samod_core::CommandResult::CreateConnection` is seen. When it is created
@@ -26,10 +27,13 @@ use crate::{
 //
 // Once the connection is running on the IO loop then it becomes a place to
 // register listeners for events happening on the connection.
+//
+// Internally, `ConnectionHandle` is used for both sending and receiving. Publicly,
+// it is only provided through `AcceptorHandle`.
+/// A [`ConnectionHandle`] is provided when an [`AcceptorHandle`](crate::AcceptorHandle) accepts a connection.
 #[derive(Clone)]
-pub(crate) struct ConnectionHandle {
+pub struct ConnectionHandle {
     id: ConnectionId,
-    tx: UnboundedSender<Vec<u8>>,
     inner: Arc<RwLock<Inner>>,
 }
 
@@ -37,8 +41,10 @@ struct Inner {
     info: Option<PeerInfo>,
     handshake_listeners: Vec<oneshot::Sender<Result<PeerInfo, ConnFinishedReason>>>,
     finished_listeners: Vec<oneshot::Sender<ConnFinishedReason>>,
+    event_listeners: Vec<unbounded::UnboundedSender<AcceptorEvent>>,
     finished_reason: Option<ConnFinishedReason>,
     rx: Option<UnboundedReceiver<Vec<u8>>>,
+    tx: Option<UnboundedSender<Vec<u8>>>,
 }
 
 impl ConnectionHandle {
@@ -46,13 +52,14 @@ impl ConnectionHandle {
         let (tx, rx) = unbounded::channel();
         Self {
             id,
-            tx,
             inner: Arc::new(RwLock::new(Inner {
                 info: None,
                 handshake_listeners: Vec::new(),
                 finished_listeners: Vec::new(),
+                event_listeners: Vec::new(),
                 finished_reason: None,
                 rx: Some(rx),
+                tx: Some(tx),
             })),
         }
     }
@@ -78,12 +85,23 @@ impl ConnectionHandle {
     // Called in Inner::handle_event whenever there are outbound messages to send
     // The other end of the channel is owned by the io loop
     pub(crate) fn send(&self, msg: Vec<u8>) {
-        let _ = self.tx.unbounded_send(msg);
+        let inner = Self::read(&self.inner);
+        if let Some(tx) = inner.tx.as_ref() {
+            let _ = tx.unbounded_send(msg);
+        }
     }
 
-    // A future which completes either when the handshake completes, or the
-    // connection is finished
-    pub(crate) fn handshake_complete(
+    /// Drop the outbound sender so the IO loop's `drive_connection` sees its
+    /// outbound channel close and breaks out of its select loop with
+    /// `WeDisconnected`.
+    pub(crate) fn close(&self) {
+        let mut inner = Self::write(&self.inner);
+        inner.tx = None;
+    }
+
+    /// A future which completes either when the handshake completes, or the
+    /// connection is finished.
+    pub fn handshake_complete(
         &self,
     ) -> impl Future<Output = Result<PeerInfo, ConnFinishedReason>> + 'static {
         let inner = self.inner.clone();
@@ -102,6 +120,43 @@ impl ConnectionHandle {
             };
             rx.await.unwrap()
         }
+    }
+
+    /// Returns a stream of lifecycle events for this [`ConnectionHandle`].
+    ///
+    /// The stream yields events for client connections and disconnections.
+    /// Useful for metrics and tracking the behavior of individual connections.
+    pub fn events(&self) -> impl futures::Stream<Item = AcceptorEvent> + Unpin {
+        let (tx, rx) = unbounded::channel();
+        let mut inner = self.inner.write().unwrap();
+        inner.event_listeners.push(tx);
+        rx
+    }
+
+    /// Notify the handle that a client connected.
+    pub(crate) fn notify_client_connected(&self, peer_info: PeerInfo) {
+        let mut inner = self.inner.write().unwrap();
+
+        let event = AcceptorEvent::ClientConnected {
+            peer_info,
+            connection_id: self.id,
+        };
+        inner
+            .event_listeners
+            .retain(|tx| tx.unbounded_send(event.clone()).is_ok());
+    }
+
+    /// Notify the handle that a client disconnected.
+    pub(crate) fn notify_client_disconnected(&self, reason: ConnFinishedReason) {
+        let mut inner = self.inner.write().unwrap();
+
+        let event = AcceptorEvent::ClientDisconnected {
+            connection_id: self.id,
+            reason,
+        };
+        inner
+            .event_listeners
+            .retain(|tx| tx.unbounded_send(event.clone()).is_ok());
     }
 
     // A future which completes when the connection is finished

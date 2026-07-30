@@ -29,24 +29,22 @@
 mod doc_actor_result;
 pub mod document_actor;
 pub use doc_actor_result::DocActorResult;
+mod sync_message_stat;
+pub use sync_message_stat::{SyncDirection, SyncMessageStat};
 mod document_actor_id;
-mod document_status;
-pub(crate) use document_status::DocumentStatus;
 pub mod errors;
 pub mod io;
 mod load;
 mod on_disk_state;
 pub use on_disk_state::CompactionHash;
 mod peer_doc_connection;
-mod ready;
-mod request;
+mod phase;
 mod spawn_args;
 mod with_doc_result;
 pub use with_doc_result::WithDocResult;
 
 // Internal modules for async runtime
 mod actor_input;
-mod doc_state;
 pub(crate) use actor_input::ActorInput;
 
 pub use document_actor::DocumentActor;

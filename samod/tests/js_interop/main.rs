@@ -1,12 +1,13 @@
-use std::{sync::Arc, time::Duration};
+use std::time::Duration;
 
 use automerge::{Automerge, ReadDoc, transaction::Transactable};
-use futures::{StreamExt, lock::Mutex};
-use samod::{ConnDirection, PeerId, Repo};
+use futures::StreamExt;
+use samod::{AcceptorHandle, BackoffConfig, PeerId, Repo};
 
 mod js_wrapper;
 use js_wrapper::JsWrapper;
 use tokio::net::TcpListener;
+use url::Url;
 
 fn init_logging() {
     let _ = tracing_subscriber::fmt()
@@ -28,7 +29,7 @@ async fn sync_rust_clients_via_js_server() {
         .with_document(|doc| {
             doc.transact(|tx| {
                 tx.put(automerge::ROOT, "key", "value")?;
-                Ok::<_, automerge::AutomergeError>(())
+                Ok::<_, Box<automerge::AutomergeError>>(())
             })
         })
         .unwrap();
@@ -132,21 +133,119 @@ async fn two_js_clients_can_send_ephemera_through_rust_server() {
     assert_eq!(msg, "hello");
 }
 
+/// Test that a JS client which uses remote heads subscriptions (sending a
+/// `remote-subscription-change` message with only an `add` field and no `remove`) doesn't
+/// cause the Rust server to drop the connection. Before the fix, the missing `remove` field
+/// caused a decode error that terminated the connection.
+#[tokio::test]
+async fn js_client_with_remote_heads_subscription_can_sync_through_rust_server() {
+    init_logging();
+    let server = start_rust_server().await;
+    let js = JsWrapper::create().await.unwrap();
+
+    // This JS client enables remote heads gossiping and subscribes to a storage ID.
+    // When it connects, it sends a `remote-subscription-change` message with only `add`
+    // (no `remove` field) to the Rust server.
+    let (doc_id, heads, _child1) = js
+        .subscribe_and_create_doc(server.port, "1fcd2698-3426-4288-9c47-85364db5073b")
+        .await
+        .unwrap();
+
+    // If the Rust server choked on the subscription message and dropped the connection,
+    // the document won't have been synced and this fetch will fail.
+    let fetched_heads = js.fetch_doc(server.port, doc_id).await.unwrap();
+
+    assert_eq!(heads, fetched_heads);
+}
+
+/// Test that a JS client sending `remote-heads-changed` messages (which contain timestamps
+/// encoded as CBOR float64 by cbor-x) doesn't cause the Rust server to drop the connection.
+///
+/// The setup: a JS client first syncs a document with a JS server (which has a storage ID),
+/// storing remote heads info with a `Date.now()` timestamp. It then connects to the Rust server,
+/// which becomes a "generous peer", triggering `addGenerousPeer` to send a `remote-heads-changed`
+/// message to the Rust server with the f64 timestamp.
+#[tokio::test]
+async fn js_client_sending_remote_heads_changed_does_not_break_rust_server() {
+    init_logging();
+    let js = JsWrapper::create().await.unwrap();
+    let js_server = js.start_server().await.unwrap();
+    let rust_server = start_rust_server().await;
+
+    // This JS client first syncs with the JS server (building up remote heads info),
+    // then connects to the Rust server, which triggers a `remote-heads-changed` message
+    // with a float64-encoded timestamp being sent to the Rust server.
+    let (doc_id, heads, _child1) = js
+        .create_and_relay_heads(js_server.port, rust_server.port)
+        .await
+        .unwrap();
+
+    // If the Rust server choked on the remote-heads-changed message (f64 timestamp),
+    // the document won't have been synced and this fetch will fail.
+    let fetched_heads = js.fetch_doc(rust_server.port, doc_id).await.unwrap();
+
+    assert_eq!(heads, fetched_heads);
+}
+
+/// Test that the JS server saves sync state for a non-ephemeral samod peer.
+///
+/// When samod connects with `isEphemeral: false` and a `storageId`, the JS
+/// automerge-repo should persist sync state keyed by that storage ID. If this
+/// doesn't happen, reconnecting peers will have to re-sync from scratch,
+/// resulting in unnecessarily large initial sync messages.
+#[tokio::test]
+async fn js_server_saves_sync_state_for_non_ephemeral_samod_peer() {
+    init_logging();
+    let js = JsWrapper::create().await.unwrap();
+    let js_server = js.start_server().await.unwrap();
+    let port = js_server.port;
+
+    let repo = samod_connected_to_js_server(port, Some("repo1".to_string())).await;
+
+    let doc_handle = repo.create(Automerge::new()).await.unwrap();
+    doc_handle
+        .with_document(|doc| {
+            doc.transact(|tx| {
+                tx.put(automerge::ROOT, "key", "value")?;
+                Ok::<_, Box<automerge::AutomergeError>>(())
+            })
+        })
+        .unwrap();
+
+    // Wait for sync to complete and sync state to be persisted
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+
+    let keys = js_server.storage_keys().await.unwrap();
+    println!("JS server storage keys: {:?}", keys);
+
+    // The JS server should have saved sync state for the samod peer.
+    // Sync state keys have the form [documentId, "sync-state", storageId].
+    let has_sync_state = keys
+        .iter()
+        .any(|key| key.len() >= 2 && key[1] == "sync-state");
+    assert!(
+        has_sync_state,
+        "JS server should have saved sync state for the non-ephemeral samod peer, but storage keys were: {:?}",
+        keys
+    );
+}
+
 async fn samod_connected_to_js_server(port: u16, peer_id: Option<String>) -> Repo {
     let mut builder = Repo::build_tokio();
     if let Some(peer_id) = peer_id {
         builder = builder.with_peer_id(PeerId::from(peer_id.as_str()));
     }
-    let handle = builder.load().await;
-    let (conn, _) = tokio_tungstenite::connect_async(format!("ws://localhost:{}", port))
+    let repo = builder.load().await;
+    let url = Url::parse(&format!("ws://localhost:{}", port)).unwrap();
+
+    let dialer_handle = repo.dial_websocket(url, BackoffConfig::default()).unwrap();
+
+    tokio::time::timeout(Duration::from_secs(5), dialer_handle.established())
         .await
-        .unwrap();
+        .expect("dial_websocket timed out")
+        .expect("dial_websocket failed");
 
-    handle
-        .connect_tungstenite(conn, ConnDirection::Outgoing)
-        .unwrap();
-
-    handle
+    repo
 }
 
 struct RunningRustServer {
@@ -154,48 +253,36 @@ struct RunningRustServer {
     #[allow(dead_code)]
     handle: Repo,
     #[allow(dead_code)]
-    running_connections: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    acceptor: AcceptorHandle,
 }
 
 async fn start_rust_server() -> RunningRustServer {
     let handle = Repo::build_tokio().load().await;
-    let running_connections = Arc::new(Mutex::new(Vec::new()));
-    let app = axum::Router::new()
-        .route("/", axum::routing::get(websocket_handler))
-        .with_state((handle.clone(), running_connections.clone()));
     let listener = TcpListener::bind("0.0.0.0:0")
         .await
         .expect("unable to bind socket");
     let port = listener.local_addr().unwrap().port();
+    let url = Url::parse(&format!("ws://0.0.0.0:{}", port)).unwrap();
+    let acceptor = handle.make_acceptor(url).unwrap();
+    let app = axum::Router::new()
+        .route("/", axum::routing::get(websocket_handler))
+        .with_state(acceptor.clone());
     let server = axum::serve(listener, app).into_future();
     tokio::spawn(server);
     RunningRustServer {
         port,
         handle,
-        running_connections,
+        acceptor,
     }
 }
 
-#[allow(clippy::type_complexity)]
 async fn websocket_handler(
     ws: axum::extract::ws::WebSocketUpgrade,
-    axum::extract::State((handle, running_connections)): axum::extract::State<(
-        Repo,
-        Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
-    )>,
+    axum::extract::State(acceptor): axum::extract::State<AcceptorHandle>,
 ) -> axum::response::Response {
-    ws.on_upgrade(|socket| handle_socket(socket, handle, running_connections))
-}
-
-async fn handle_socket(
-    socket: axum::extract::ws::WebSocket,
-    repo: Repo,
-    running_connections: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
-) {
-    let conn = repo.accept_axum(socket).unwrap();
-    let handle = tokio::spawn(async move {
-        let finished = conn.finished().await;
-        tracing::error!(?finished, "connection finished");
-    });
-    running_connections.lock().await.push(handle);
+    ws.on_upgrade(|socket| async move {
+        if let Err(e) = acceptor.accept_axum(socket) {
+            tracing::error!(?e, "failed to accept axum websocket");
+        }
+    })
 }

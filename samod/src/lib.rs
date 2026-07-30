@@ -76,70 +76,54 @@
 //!
 //! ### Connecting to peers
 //!
-//! Once you have a `Repo` you can connect it to peers using [`Repo::connect`].
-//! This method accepts a [`Stream`] and a [`Sink`] of `Vec<u8>` represnting
-//! a bidirectional communication channel and returns a [`Connection`] object
-//! which can be used to find out more information about the connection as it
-//! progresses. Here's an example where we use `futures::channel::mpsc` as the
-//! transport. We create two repos and connect them with these channels.
+//! Connections are managed via **dialers** and **acceptors** (listeners).
 //!
-//! ```rust
-//! use samod::ConnDirection;
-//! use futures::{StreamExt, channel::mpsc};
-//! use std::convert::Infallible;
-//!
-//! # #[cfg(feature="tokio")]
-//! tokio_test::block_on(async {
-//! let alice = samod::Repo::build_tokio().load().await;
-//! let bob = samod::Repo::build_tokio().load().await;
-//!
-//! // Set up bidirectional channels
-//! let (tx_to_bob, rx_from_alice) = mpsc::unbounded();
-//! let (tx_to_alice, rx_from_bob) = mpsc::unbounded();
-//! // This is just to make the types line up, ignore it
-//! let rx_from_alice = rx_from_alice.map(Ok::<_, Infallible>);
-//! let rx_from_bob = rx_from_bob.map(Ok::<_, Infallible>);
-//!
-//! // Run the connection futures
-//! let alice_to_bob = alice.connect(rx_from_bob, tx_to_bob, ConnDirection::Outgoing).unwrap();
-//! bob.connect(rx_from_alice, tx_to_alice, ConnDirection::Incoming);
-//!
-//! // Now wait for alice to be connected
-//! alice_to_bob.handshake_complete().await;
-//! });
-//! ```
-//!
-//! If you are using `tokio` and connecting to something like a TCP socket you
-//! can use [`Repo::connect_tokio_io`], which reduces some boilerplate:
+//! - A **dialer** actively connects to a remote endpoint and automatically
+//!   reconnects with exponential backoff. Create one with [`Repo::dial()`],
+//!   which takes a [`BackoffConfig`] and an `Arc<dyn Dialer>`
+//! - `Repo::find` will wait for any dialers which are in the process of
+//!   connection to either establish a connection, or start retrying,
+//!   before marking a document as unavailable. This means that as long
+//!   as you add the [`Dialer`] before calling `Repo::find` you won't have to
+//!   coordinate the timing of your dialers and document lookups.
+//! - An **acceptor** passively accepts inbound connections. Create one with
+//!   [`Repo::make_acceptor()`], then feed accepted transports via
+//!   [`AcceptorHandle::accept()`].
 //!
 //! ```rust,no_run
-//! # #[cfg(feature="tokio")]
-//! # async fn dosomething() {
-//! use samod::ConnDirection;
-//!
-//! let repo: samod::Repo = todo!();
-//! let io = tokio::net::TcpStream::connect("sync.automerge.org").await.unwrap();
-//! repo.connect_tokio_io(io, ConnDirection::Outgoing);
+//! // In this case we use the built in ChannelDialer which is useful for simple tests
+//! // more useful implementations wrap actual network transports
+//! # use samod::{BackoffConfig, Repo};
+//! # use samod::transport::channel::ChannelDialer;
+//! # use std::sync::Arc;
+//! # async fn doit() {
+//! let bob: Repo = todo!();
+//! let alice: Repo = todo!();
+//! let url = url::Url::parse("samod-channel://my-channel").unwrap();
+//! let acceptor = bob.make_acceptor(url).unwrap();
+//! let channel_dialer = ChannelDialer::new(acceptor);
+//! let dialer_handle = alice.dial(BackoffConfig::default(), Arc::new(channel_dialer)).unwrap();
+//! // Wait for the first successful connection + handshake
+//! let peer_info = dialer_handle.established().await.unwrap();
 //! # }
 //! ```
 //!
-//! If you are connecting to JavaScript sync server using WebSockets you can enable the
-//! `tungstenite` feature and use [`Repo::connect_websocket`]. If you are accepting
-//! websocket connections in an `axum` server you can use [`Repo::accept_axum`].
+//! #### Dialer handles
 //!
-//! #### Connections
+//! The [`DialerHandle`] returned by [`Repo::dial()`] can be used to:
+//! - Wait for the first successful connection with [`DialerHandle::established()`]
+//! - Observe lifecycle events (connect, disconnect, retry, failure) with
+//!   [`DialerHandle::events()`]
+//! - Check if connected with [`DialerHandle::is_connected()`]
+//! - Close the dialer with [`DialerHandle::close()`]
 //!
-//! The [`Connection`] returned by [`Repo::connect`] can be used to listen for
-//! changes to the connection state. Initially a connection is in a
-//! "handshaking" state, where we know nothing about the other end. Once the
-//! handshake is complete we know the peer ID and (possibly) storage ID of the
-//! other end. This information is often useful if you're specifically
-//! interested in waiting for the connection to a particular peer to be
-//! established before trying to sync changes with them. To wait for the
-//! connection to be established you can await [`Connection::handshake_complete`].
+//! #### Acceptor handles
 //!
-//! It's also often useful to know when a connection has been disconnected, to
-//! learn about this you can await [`Connection::finished`].
+//! The [`AcceptorHandle`] returned by [`Repo::make_acceptor()`] can be used to:
+//! - Accept inbound connections with [`AcceptorHandle::accept()`]
+//! - Observe lifecycle events with [`AcceptorHandle::events()`]
+//! - Check connection count with [`AcceptorHandle::connection_count()`]
+//! - Close the acceptor with [`AcceptorHandle::close()`]
 //!
 //! ### Managing Documents
 //!
@@ -234,71 +218,71 @@
 //!
 //! ## Example
 //!
-//! Here's a somewhat fully featured example of using `samod` to manage a todo list:
+//! Here's a somewhat fully featured example of using `samod` to manage a todo list
+//! across two repos (representing two different devices):
 //!
 //! ```rust
 //! # #[cfg(feature="tokio")]
 //! # tokio_test::block_on(async {
 //! use automerge::{ReadDoc, transaction::{Transactable as _}};
 //! use futures::StreamExt as _;
-//! use samod::ConnDirection;
-//! use std::convert::Infallible;
+//! use samod::{BackoffConfig, transport::channel::ChannelDialer};
+//! use std::sync::Arc;
 //!
 //! # let _ = tracing_subscriber::fmt().try_init();
 //!
-//! let repo = samod::Repo::build_tokio().load().await; // You don't have to use tokio
+//! // Create two repos, representing two different devices
+//! let alice = samod::Repo::build_tokio().load().await;
+//! let bob = samod::Repo::build_tokio().load().await;
 //!
-//! // Create an initial skeleton for our todo list
+//! // Create an initial skeleton for our todo list on alice
 //! let mut initial_doc = automerge::Automerge::new();
 //! initial_doc.transact::<_, _, automerge::AutomergeError>(|tx| {
-//!     let todos = tx.put_object(automerge::ROOT, "todos", automerge::ObjType::List)?;
+//!     let _todos = tx.put_object(automerge::ROOT, "todos", automerge::ObjType::List)?;
 //!     Ok(())
 //! }).unwrap();
 //!
-//! // Now create a `samod::DocHandle` using `Repo::create`
-//! let doc_handle_1 = repo.create(initial_doc).await.unwrap();
+//! // Now create a `samod::DocHandle` on alice using `Repo::create`
+//! let alice_handle = alice.create(initial_doc).await.unwrap();
 //!
-//! // Now, create second repo, representing some other device
-//! let repo2 = samod::Repo::build_tokio().load().await;
+//! // Bob registers an acceptor; alice dials bob via an in-process ChannelDialer
+//! let url = url::Url::parse("channel://alice-to-bob").unwrap();
+//! let acceptor = bob.make_acceptor(url).unwrap();
+//! let channel_dialer = ChannelDialer::new(acceptor);
+//! let dialer_handle = alice.dial(BackoffConfig::default(), Arc::new(channel_dialer)).unwrap();
 //!
-//! // Connect the two repos to each other
-//! let (tx_to_1, rx_from_2) = futures::channel::mpsc::unbounded();
-//! let (tx_to_2, rx_from_1) = futures::channel::mpsc::unbounded();
-//! repo2.connect(rx_from_1.map(Ok::<_, Infallible>), tx_to_1, ConnDirection::Outgoing);
-//! repo.connect(rx_from_2.map(Ok::<_, Infallible>), tx_to_2, ConnDirection::Incoming);
+//! // Wait for alice to be connected to bob
+//! dialer_handle.established().await.unwrap();
 //!
-//! // Wait for the second repo to be connected to the first repo
-//! repo2.when_connected(repo.peer_id()).await.unwrap();
+//! // Bob can now fetch alice's document
+//! let bob_handle = bob.find(alice_handle.document_id().clone()).await.unwrap().unwrap();
 //!
-//! // Now fetch the document on repo2
-//! let doc2 = repo2.find(doc_handle_1.document_id().clone()).await.unwrap().unwrap();
-//!
-//! // Create a todo list item in doc2
-//! doc2.with_document(|doc| {
+//! // Make a change on bob's side
+//! bob_handle.with_document(|doc| {
 //!     doc.transact(|tx| {
-//!        let todos = tx.get(automerge::ROOT, "todos").unwrap().
-//!           expect("todos should exist").1;
+//!        let todos = tx.get(automerge::ROOT, "todos").unwrap()
+//!           .expect("todos should exist").1;
 //!        tx.insert(todos, 0, "Buy milk")?;
-//!       Ok::<_, automerge::AutomergeError>(())
-//!   }).unwrap();
+//!        Ok::<_, automerge::AutomergeError>(())
+//!     }).unwrap();
 //! });
 //!
-//! // Wait for the change to be received on repo1
-//! doc_handle_1.changes().next().await.unwrap();
+//! // Wait for the change to be received on alice's side
+//! alice_handle.changes().next().await.unwrap();
 //!
-//! // See the the document handle on repo1 reflects the change
-//! doc_handle_1.with_document(|doc| {
-//!   let todos = doc.get(automerge::ROOT, "todos").unwrap().
-//!      expect("todos should exist").1;
-//!   let item = doc.get(todos, 0).unwrap().expect("item should exist").0;
-//!   let automerge::Value::Scalar(val) = item else {
-//!     panic!("item should be a scalar");
-//!   };
-//!   let automerge::ScalarValue::Str(s) = val.as_ref() else {
-//!        panic!("item should be a string");
-//!   };
-//!   assert_eq!(s, "Buy milk");
-//!   Ok::<_, automerge::AutomergeError>(())
+//! // Alice's document now reflects bob's change
+//! alice_handle.with_document(|doc| {
+//!     let todos = doc.get(automerge::ROOT, "todos").unwrap()
+//!         .expect("todos should exist").1;
+//!     let item = doc.get(todos, 0).unwrap().expect("item should exist").0;
+//!     let automerge::Value::Scalar(val) = item else {
+//!         panic!("item should be a scalar");
+//!     };
+//!     let automerge::ScalarValue::Str(s) = val.as_ref() else {
+//!         panic!("item should be a string");
+//!     };
+//!     assert_eq!(s, "Buy milk");
+//!     Ok::<_, automerge::AutomergeError>(())
 //! }).unwrap();
 //! # });
 //! ```
@@ -310,12 +294,12 @@ use std::{
 
 use automerge::Automerge;
 use futures::{
-    FutureExt, Sink, SinkExt, Stream, StreamExt, TryStreamExt, channel::oneshot,
-    stream::FuturesUnordered,
+    FutureExt, Stream, StreamExt, channel::mpsc, channel::oneshot, stream::FuturesUnordered,
 };
 use rand::SeedableRng;
 pub use samod_core::{
-    AutomergeUrl, ConnectionId, DocumentId, PeerId, StorageId, network::ConnDirection,
+    AutomergeUrl, BackoffConfig, ConnectionId, DialerId, DocSearch, DocumentId, ListenerId, PeerId,
+    PeerRequestState, StorageId, network::ConnDirection,
 };
 use samod_core::{
     CommandId, CommandResult, DocumentActorId, LoaderState, UnixTimestamp,
@@ -325,9 +309,10 @@ use samod_core::{
         hub::{DispatchedCommand, Hub, HubEvent, HubResults, io::HubIoAction},
     },
     io::{IoResult, IoTask},
-    network::ConnectionEvent,
+    network::{ConnectionEvent, ConnectionOwner, DialerConfig, ListenerConfig},
 };
 use tracing::Instrument;
+pub use url::Url;
 
 mod actor_task;
 use actor_task::ActorTask;
@@ -336,23 +321,36 @@ use actor_handle::ActorHandle;
 mod announce_policy;
 mod builder;
 pub use builder::RepoBuilder;
+mod acceptor_handle;
+pub use acceptor_handle::{AcceptorEvent, AcceptorHandle};
 mod conn_finished_reason;
 mod connection;
+mod dialer_handle;
 pub use conn_finished_reason::ConnFinishedReason;
 pub use connection::Connection;
+pub use dialer_handle::{DialerEvent, DialerFailed, DialerHandle};
+mod dialer;
+pub use dialer::Dialer;
 mod doc_actor_inner;
 mod doc_handle;
 mod doc_runner;
 mod io_loop;
+mod observer;
 pub use doc_handle::DocHandle;
+pub use observer::{RepoEvent, RepoObserver, StorageOperation};
 mod peer_connection_info;
 mod peer_info;
 pub use peer_connection_info::{ConnectionInfo, ConnectionState, PeerDocState};
 pub use peer_info::PeerInfo;
+mod search;
+pub use search::SearchState;
 mod stopped;
 pub use stopped::Stopped;
 pub mod storage;
-pub use crate::announce_policy::{AlwaysAnnounce, AnnouncePolicy, LocalAnnouncePolicy};
+pub mod transport;
+pub use crate::announce_policy::{
+    AlwaysAnnounce, AnnouncePolicy, LocalAnnouncePolicy, NeverAnnounce,
+};
 pub use crate::builder::ConcurrencyConfig;
 use crate::{
     connection::ConnectionHandle,
@@ -366,7 +364,10 @@ use crate::{
     runtime::{LocalRuntimeHandle, RuntimeHandle},
     storage::{InMemoryStorage, LocalStorage},
 };
+pub use transport::Transport;
 pub mod runtime;
+#[cfg(feature = "tokio")]
+pub mod tokio_io;
 mod unbounded;
 pub mod websocket;
 
@@ -444,7 +445,11 @@ impl Repo {
         builder::RepoBuilder::new(crate::runtime::gio::GioRuntime::new())
     }
 
-    pub(crate) async fn load<R: runtime::RuntimeHandle, S: Storage, A: AnnouncePolicy>(
+    pub(crate) async fn load<
+        R: runtime::RuntimeHandle + Clone + Send,
+        S: Storage,
+        A: AnnouncePolicy,
+    >(
         builder: RepoBuilder<S, R, A>,
     ) -> Self {
         let RepoBuilder {
@@ -453,8 +458,9 @@ impl Repo {
             peer_id,
             announce_policy,
             concurrency,
+            observer,
         } = builder;
-        let task_setup = TaskSetup::new(storage.clone(), peer_id, concurrency).await;
+        let task_setup = TaskSetup::new(storage.clone(), peer_id, concurrency, observer).await;
         let inner = task_setup.inner.clone();
         task_setup.spawn_tasks(runtime, storage, announce_policy);
         Self { inner }
@@ -462,7 +468,7 @@ impl Repo {
 
     pub(crate) async fn load_local<
         'a,
-        R: runtime::LocalRuntimeHandle + 'a,
+        R: runtime::LocalRuntimeHandle + Clone + 'static,
         S: LocalStorage + 'a,
         A: LocalAnnouncePolicy + 'a,
     >(
@@ -474,8 +480,9 @@ impl Repo {
             peer_id,
             announce_policy,
             concurrency,
+            observer,
         } = builder;
-        let task_setup = TaskSetup::new(storage.clone(), peer_id, concurrency).await;
+        let task_setup = TaskSetup::new(storage.clone(), peer_id, concurrency, observer).await;
         let inner = task_setup.inner.clone();
         task_setup.spawn_tasks_local(runtime, storage, announce_policy);
         Self { inner }
@@ -526,6 +533,65 @@ impl Repo {
         }
     }
 
+    /// Search for a document by ID, returning the current state plus a stream
+    /// of subsequent updates.
+    ///
+    /// Searching for a document causes the [`Repo`] to first load the document
+    /// from storage, and then begin synchronizing it with peers. If the document
+    /// isn't found locally then the document will be requested from connected
+    /// peers. This process is reified in the [`RepoSearchState`] enum which
+    /// this method returns.
+    ///
+    /// If the document is found then the stream will emit a
+    /// [`RepoSearchState::Found`] state containing the `DocHandle`. If the document
+    /// is not found then the stream will step through [`RepoSearchState::Loading`]
+    /// and then [`RepoSearchState::Requesting`] states. which enables the caller
+    /// to track the progress of the search. See the documentation for [`RepoSearchState`]
+    /// for more details.
+    ///
+    /// The stream emits a new [`RepoSearchState`] each time the state of the
+    /// search changes: as peers are contacted, respond, sync progresses, and
+    /// dialers connect. The stream never completes on its own — drop it to
+    /// cancel the subscription.
+    ///
+    /// Returns `Err(Stopped)` if the repo has been stopped.
+    ///
+    /// Callers who just want a convenient "find this document or tell me it
+    /// doesn't exist" semantic should use [`Repo::find`] instead.
+    pub fn search(
+        &self,
+        doc_id: DocumentId,
+    ) -> Result<(SearchState, impl Stream<Item = SearchState> + 'static), Stopped> {
+        let (tx_stream, rx_stream) = mpsc::unbounded::<SearchState>();
+        let mut inner = self.inner.lock().unwrap();
+
+        let DispatchedCommand { command_id, event } = HubEvent::search_for_doc(doc_id.clone());
+        let (tx_result, mut rx_result) = oneshot::channel();
+        inner.pending_commands.insert(command_id, tx_result);
+        inner.handle_event(event);
+
+        let (actor_id, search_state) = match rx_result.try_recv() {
+            Ok(Some(CommandResult::SearchForDoc {
+                actor_id,
+                search_state,
+            })) => (actor_id, search_state),
+            Ok(None) => return Err(Stopped), // Hub is stopped; event was ignored.
+            Ok(Some(other)) => panic!("unexpected command result {:?} for search_for_doc", other),
+            Err(_) => return Err(Stopped),
+        };
+
+        let initial = search::SearchState::from_doc_search(search_state, actor_id, &inner.actors);
+
+        // Register the subscriber for future updates only after we've
+        // consumed the initial snapshot so it isn't delivered twice.
+        inner
+            .search_state_streams
+            .entry(doc_id)
+            .or_default()
+            .push(tx_stream);
+        Ok((initial, rx_stream))
+    }
+
     /// Lookup a document by ID
     ///
     /// The [`Repo`] will first attempt to load the document from [`Storage`] and
@@ -535,142 +601,35 @@ impl Repo {
     /// synchronized with at least one remote peer which has the document. Otherwise,
     /// the future will resolve to `Ok(None)` once all peers have responded that
     /// they do not have the document.
+    ///
+    /// If there are existing [`Dialer`]s which have not yet established a connection,
+    /// but are not in the process of retrying or marked as failed then the future
+    /// will wait for them to either establish a connection or fail before resolving.
+    ///
+    /// This is a convenience wrapper around [`Repo::search`] for the common
+    /// single-shot lookup case.
     pub fn find(
         &self,
         doc_id: DocumentId,
     ) -> impl Future<Output = Result<Option<DocHandle>, Stopped>> + 'static {
-        let mut inner = self.inner.lock().unwrap();
-        let DispatchedCommand { command_id, event } = HubEvent::find_document(doc_id);
-        let (tx, rx) = oneshot::channel();
-        inner.pending_commands.insert(command_id, tx);
-        inner.handle_event(event);
-        drop(inner);
-        let inner = self.inner.clone();
+        let search_result = self.search(doc_id);
         async move {
-            match rx.await {
-                Ok(r) => match r {
-                    CommandResult::FindDocument { actor_id, found } => {
-                        if found {
-                            // By this point the document should have been spawned
-                            let handle = inner
-                                .lock()
-                                .unwrap()
-                                .actors
-                                .get(&actor_id)
-                                .map(|ActorHandle { doc: handle, .. }| handle.clone())
-                                .expect("actor should exist");
-                            Ok(Some(handle))
-                        } else {
-                            Ok(None)
-                        }
+            let (initial, mut stream) = search_result?;
+            let mut state = initial;
+            loop {
+                match state {
+                    SearchState::Found(handle) => return Ok(Some(handle)),
+                    SearchState::Requesting(ref request) if request.is_currently_unavailable() => {
+                        return Ok(None);
                     }
-                    other => {
-                        panic!("unexpected command result for create: {other:?}");
-                    }
-                },
-                Err(_) => Err(Stopped),
+                    SearchState::Requesting(_) | SearchState::Loading => {}
+                }
+                match stream.next().await {
+                    Some(next) => state = next,
+                    None => return Err(Stopped),
+                }
             }
         }
-    }
-
-    /// Connect a tokio IO stream to the repo
-    ///
-    /// This is a convenience wrapper which uses tokio_util's length delimited
-    /// codec to frame the io and passes it to [`Repo::connect`]. As with
-    /// [`Repo::connect`] the returned future must be driven to completion to
-    /// keep the connection alive and the `ConnFinishedReason` returned
-    /// indicates why the connection ended.
-    ///
-    /// ## Example
-    ///
-    /// ```rust,no_run
-    /// # #[cfg(feature="tokio")]
-    /// # async fn dosomething() {
-    /// use samod::ConnDirection;
-    ///
-    /// let repo: samod::Repo = todo!();
-    /// let io = tokio::net::TcpStream::connect("sync.automerge.org").await.unwrap();
-    /// repo.connect_tokio_io(io, ConnDirection::Outgoing).unwrap();
-    /// # }
-    /// ```
-    #[cfg(feature = "tokio")]
-    pub fn connect_tokio_io<Io: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + 'static>(
-        &self,
-        io: Io,
-        direction: ConnDirection,
-    ) -> Result<Connection, Stopped> {
-        let framed =
-            tokio_util::codec::Framed::new(io, tokio_util::codec::LengthDelimitedCodec::new());
-        let (write_half, read_half) = framed.split();
-        let write_half = write_half
-            .with::<Vec<u8>, _, _, std::io::Error>(|msg| std::future::ready(Ok(msg.into())));
-        let read_half = read_half.map(|res| match res {
-            Ok(bytes) => Ok(bytes.to_vec()),
-            Err(e) => Err(e),
-        });
-        self.connect(read_half, write_half, direction)
-    }
-
-    /// Connect a new peer
-    ///
-    /// The future returned by this method must be driven to completion in order
-    /// to continue processing the messages sent by the peer. If the future is
-    /// dropped, the connection will be closed.
-    ///
-    /// The returned future willl resolve to a [`ConnFinishedReason`] indicating why
-    /// the connection ended, this can be used to determine whether to attempt to
-    /// reconnect.
-    #[tracing::instrument(skip(self, stream, sink), fields(local_peer_id = tracing::field::Empty))]
-    pub fn connect<Str, Snk, SendErr, RecvErr>(
-        &self,
-        stream: Str,
-        sink: Snk,
-        direction: ConnDirection,
-    ) -> Result<Connection, Stopped>
-    where
-        SendErr: std::error::Error + Send + Sync + 'static,
-        RecvErr: std::error::Error + Send + Sync + 'static,
-        Snk: Sink<Vec<u8>, Error = SendErr> + Send + 'static + Unpin,
-        Str: Stream<Item = Result<Vec<u8>, RecvErr>> + Send + 'static + Unpin,
-    {
-        tracing::Span::current().record(
-            "local_peer_id",
-            self.inner.lock().unwrap().hub.peer_id().to_string(),
-        );
-        let mut inner = self.inner.lock().unwrap();
-        let DispatchedCommand { command_id, event } = HubEvent::create_connection(direction);
-        let (tx_result, mut rx_result) = oneshot::channel();
-        inner.pending_commands.insert(command_id, tx_result);
-        inner.handle_event(event);
-        let connection_id = match rx_result.try_recv() {
-            Ok(None) => panic!("CreateConnection command should complete immediately"),
-            Ok(Some(CommandResult::CreateConnection { connection_id })) => connection_id,
-            Ok(other) => panic!(
-                "unexpected command result {:?} for create connection",
-                other
-            ),
-            Err(_) => return Err(Stopped),
-        };
-
-        let stream =
-            stream.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync + 'static>);
-        let sink = sink
-            .sink_map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync + 'static>);
-
-        let conn_handle = inner
-            .connections
-            .get(&connection_id)
-            .expect("connection not found")
-            .clone();
-
-        let loop_task = IoLoopTask::DriveConnection(DriveConnectionTask {
-            conn_handle: conn_handle.clone(),
-            stream: stream.boxed(),
-            sink: Box::pin(sink),
-        });
-        inner.tx_io.unbounded_send(loop_task).map_err(|_| Stopped)?;
-
-        Ok(Connection::new(conn_handle))
     }
 
     /// Wait for some connection to be established with the given remote peer ID
@@ -708,6 +667,11 @@ impl Repo {
         self.inner.lock().unwrap().hub.peer_id().clone()
     }
 
+    /// Get the currently connected peers and a stream of changes to the connected peers
+    ///
+    /// The returned stream will be the entire state of the connected peers,
+    /// emitted whenever any part of that state changes (such as when new peers
+    /// are added, or a new message is sent)
     pub fn connected_peers(
         &self,
     ) -> (
@@ -725,6 +689,173 @@ impl Repo {
             .map(|c| c.into())
             .collect();
         (now, rx_events)
+    }
+
+    /// Register a dialer with automatic reconnection.
+    ///
+    /// The [`Dialer`] knows both *where* to connect ([`Dialer::url`]) and
+    /// *how* to connect ([`Dialer::connect`]). It is called each time a new
+    /// transport is needed — on the initial dial and on each reconnection
+    /// attempt after backoff.
+    ///
+    /// Reconnection timing is controlled by the `backoff` parameter. The
+    /// dialer will automatically reconnect with exponential backoff and
+    /// jitter when a connection is lost or a transport establishment fails.
+    ///
+    /// Returns a [`DialerHandle`] that can be used to observe lifecycle events
+    /// (connected, disconnected, reconnecting, failed) and to wait for the
+    /// first successful connection.
+    ///
+    /// # Arguments
+    ///
+    /// * `backoff` - Backoff configuration for reconnection attempts.
+    /// * `dialer` - A [`Dialer`] that establishes transports.
+    ///
+    /// # Returns
+    ///
+    /// A [`DialerHandle`] for observing and controlling the dialer.
+    pub fn dial(
+        &self,
+        backoff: BackoffConfig,
+        dialer: Arc<dyn Dialer>,
+    ) -> Result<DialerHandle, Stopped> {
+        let mut inner = self.inner.lock().unwrap();
+
+        let url = dialer.url();
+        let config = DialerConfig { url, backoff };
+
+        let DispatchedCommand { command_id, event } = HubEvent::add_dialer(config);
+        let (tx_result, mut rx_result) = oneshot::channel();
+        inner.pending_commands.insert(command_id, tx_result);
+        inner.handle_event(event);
+
+        let dialer_id = match rx_result.try_recv() {
+            Ok(Some(CommandResult::AddDialer { dialer_id })) => dialer_id,
+            Ok(None) => return Err(Stopped), // Hub is stopped, event was ignored
+            Ok(Some(other)) => panic!("unexpected command result {:?} for add_dialer", other),
+            Err(_) => return Err(Stopped),
+        };
+
+        // Register the dialer so the IO loop can use it for (re)connections
+        inner.dialers.lock().unwrap().insert(dialer_id, dialer);
+
+        // Create and register the dialer handle
+        let handle = DialerHandle::new(dialer_id, self.clone());
+        inner.dialer_handles.insert(dialer_id, handle.clone());
+
+        Ok(handle)
+    }
+
+    /// Register an acceptor for inbound connections on the given URL.
+    ///
+    /// This is typically called once at startup for each endpoint the server
+    /// listens on (e.g. a WebSocket handler on port 8080). The returned
+    /// [`AcceptorHandle`] is then used to feed individual accepted connections
+    /// via [`AcceptorHandle::accept()`].
+    ///
+    /// The URL is used for logging and identifying the endpoint in
+    /// debugging output.
+    pub fn make_acceptor(&self, url: url::Url) -> Result<AcceptorHandle, Stopped> {
+        let mut inner = self.inner.lock().unwrap();
+
+        // Check if a listener already exists for this URL
+        if let Some(listener_id) = inner.find_listener_for_url(&url)
+            && let Some(handle) = inner.acceptor_handles.get(&listener_id)
+        {
+            return Ok(handle.clone());
+        }
+
+        let config = ListenerConfig { url };
+
+        let DispatchedCommand { command_id, event } = HubEvent::add_listener(config);
+        let (tx_result, mut rx_result) = oneshot::channel();
+        inner.pending_commands.insert(command_id, tx_result);
+        inner.handle_event(event);
+
+        let listener_id = match rx_result.try_recv() {
+            Ok(Some(CommandResult::AddListener { listener_id })) => listener_id,
+            Ok(None) => return Err(Stopped),
+            Ok(Some(other)) => panic!("unexpected command result {:?} for add_listener", other),
+            Err(_) => return Err(Stopped),
+        };
+
+        // Create and register the acceptor handle
+        let handle = AcceptorHandle::new(listener_id, self.clone());
+        inner.acceptor_handles.insert(listener_id, handle.clone());
+
+        Ok(handle)
+    }
+
+    /// Remove a dialer by ID. Used by `DialerHandle::close()`.
+    pub(crate) fn remove_dialer_by_id(&self, dialer_id: DialerId) -> Result<(), Stopped> {
+        let mut inner = self.inner.lock().unwrap();
+
+        // Remove the dialer
+        inner.dialers.lock().unwrap().remove(&dialer_id);
+
+        // Remove handle
+        inner.dialer_handles.remove(&dialer_id);
+
+        let event = HubEvent::remove_dialer(dialer_id);
+        inner.handle_event(event);
+        Ok(())
+    }
+
+    /// Remove a listener by ID. Used by `AcceptorHandle::close()`.
+    pub(crate) fn remove_listener_by_id(&self, listener_id: ListenerId) -> Result<(), Stopped> {
+        let mut inner = self.inner.lock().unwrap();
+
+        // Remove handle
+        inner.acceptor_handles.remove(&listener_id);
+
+        let event = HubEvent::remove_listener(listener_id);
+        inner.handle_event(event);
+        Ok(())
+    }
+
+    /// Internal: accept a connection on an existing listener. Used by
+    /// `AcceptorHandle::accept()`.
+    pub(crate) fn accept_on_listener(
+        &self,
+        listener_id: ListenerId,
+        transport: crate::Transport,
+    ) -> Result<ConnectionHandle, Stopped> {
+        let mut inner = self.inner.lock().unwrap();
+
+        // Create the connection atomically associated with the listener
+        let DispatchedCommand { command_id, event } =
+            HubEvent::create_listener_connection(listener_id);
+        let (tx_result, mut rx_result) = oneshot::channel();
+        inner.pending_commands.insert(command_id, tx_result);
+        inner.handle_event(event);
+
+        let connection_id = match rx_result.try_recv() {
+            Ok(Some(CommandResult::CreateConnection { connection_id })) => connection_id,
+            Ok(other) => panic!(
+                "unexpected command result {:?} for create_listener_connection",
+                other
+            ),
+            Err(_) => return Err(Stopped),
+        };
+
+        if let Some(obs) = inner.observer.as_ref() {
+            obs.observe(&RepoEvent::ConnectionEstablished { connection_id })
+        }
+
+        let conn_handle = inner
+            .connections
+            .get(&connection_id)
+            .expect("connection not found")
+            .clone();
+
+        let loop_task = IoLoopTask::DriveConnection(DriveConnectionTask {
+            conn_handle: conn_handle.clone(),
+            stream: transport.stream,
+            sink: transport.sink,
+        });
+        inner.tx_io.unbounded_send(loop_task).map_err(|_| Stopped)?;
+
+        Ok(conn_handle)
     }
 
     /// Stop the `Samod` instance.
@@ -758,9 +889,19 @@ struct Inner {
     waiting_for_connection: HashMap<PeerId, Vec<oneshot::Sender<Connection>>>,
     stop_waiters: Vec<oneshot::Sender<()>>,
     rng: rand::rngs::StdRng,
+    dialers: Arc<Mutex<HashMap<DialerId, io_loop::DynDialer>>>,
+    dialer_handles: HashMap<DialerId, DialerHandle>,
+    acceptor_handles: HashMap<ListenerId, AcceptorHandle>,
+    observer: Option<Arc<dyn observer::RepoObserver>>,
+    search_state_streams: HashMap<DocumentId, Vec<mpsc::UnboundedSender<SearchState>>>,
 }
 
 impl Inner {
+    /// Find a listener for the given URL.
+    fn find_listener_for_url(&self, url: &url::Url) -> Option<ListenerId> {
+        self.hub.find_listener_for_url(url)
+    }
+
     /// Dispatch a task to a document actor.
     ///
     /// In async mode, this sends the task via the actor's channel stored in DocRunner.
@@ -791,6 +932,13 @@ impl Inner {
 
     #[tracing::instrument(skip(self, event), fields(local_peer_id=%self.hub.peer_id()))]
     fn handle_event(&mut self, event: HubEvent) {
+        // The hub itself will gracefully ignore events after it has stopped,
+        // but we short-circuit here to avoid unnecessary work.
+        if self.hub.is_stopped() {
+            tracing::trace!("ignoring event on stopped hub");
+            return;
+        }
+        let hub_start = std::time::Instant::now();
         let now = UnixTimestamp::now();
         let HubResults {
             new_tasks,
@@ -799,6 +947,12 @@ impl Inner {
             actor_messages,
             stopped,
             connection_events,
+            dial_requests,
+            dialer_events,
+            event_type,
+            connections_count,
+            documents_count,
+            search_state_updates,
         } = self.hub.handle_event(&mut self.rng, now, event);
 
         for spawn_args in spawn_actors {
@@ -834,11 +988,16 @@ impl Inner {
                     }
                 }
                 HubIoAction::Disconnect { connection_id } => {
-                    if self.connections.remove(&connection_id).is_none() {
-                        tracing::warn!(
-                            "Tried to disconnect unknown connection: {:?}",
-                            connection_id
-                        );
+                    match self.connections.remove(&connection_id) {
+                        Some(conn_handle) => {
+                            conn_handle.close();
+                        }
+                        None => {
+                            tracing::warn!(
+                                "Tried to disconnect unknown connection: {:?}",
+                                connection_id
+                            );
+                        }
                     }
                 }
             }
@@ -860,32 +1019,163 @@ impl Inner {
             match evt {
                 ConnectionEvent::HandshakeCompleted {
                     connection_id,
+                    owner,
                     peer_info,
                 } => {
                     if let Some(conn_handle) = self.connections.get(&connection_id) {
-                        conn_handle.notify_handshake_complete(peer_info.clone().into());
+                        let samod_peer_info: PeerInfo = peer_info.clone().into();
+                        conn_handle.notify_handshake_complete(samod_peer_info.clone());
                         if let Some(tx) = self.waiting_for_connection.get_mut(&peer_info.peer_id) {
                             for tx in tx.drain(..) {
                                 let _ = tx.send(Connection::new(conn_handle.clone()));
+                            }
+                        }
+
+                        // Route to DialerHandle or AcceptorHandle based on owner
+                        match owner {
+                            ConnectionOwner::Dialer(dialer_id) => {
+                                if let Some(dh) = self.dialer_handles.get(&dialer_id) {
+                                    dh.notify_connected(samod_peer_info, connection_id);
+                                }
+                            }
+                            ConnectionOwner::Listener(listener_id) => {
+                                if let Some(ah) = self.acceptor_handles.get(&listener_id) {
+                                    ah.notify_client_connected(
+                                        samod_peer_info.clone(),
+                                        connection_id,
+                                    );
+                                }
+                                conn_handle.notify_client_connected(samod_peer_info);
                             }
                         }
                     }
                 }
                 ConnectionEvent::ConnectionFailed {
                     connection_id,
+                    owner,
                     error,
                 } => {
-                    tracing::error!(
+                    tracing::debug!(
                         ?connection_id,
                         ?error,
-                        "connection failed, notifying waiting tasks",
+                        "connection closed, notifying waiting tasks",
                     );
+
+                    if let Some(ref obs) = self.observer {
+                        obs.observe(&observer::RepoEvent::ConnectionLost { connection_id });
+                    }
+
+                    // Notify dialer/acceptor handle of disconnection
+                    match owner {
+                        ConnectionOwner::Dialer(dialer_id) => {
+                            if let Some(dh) = self.dialer_handles.get(&dialer_id) {
+                                dh.notify_disconnected(error.clone());
+                            }
+                        }
+                        ConnectionOwner::Listener(listener_id) => {
+                            if let Some(ah) = self.acceptor_handles.get(&listener_id) {
+                                ah.notify_client_disconnected(
+                                    connection_id,
+                                    ConnFinishedReason::ErrorReceiving(error.clone()),
+                                );
+                                if let Some(conn_handle) = self.connections.get(&connection_id) {
+                                    conn_handle.notify_client_disconnected(
+                                        ConnFinishedReason::ErrorReceiving(error.clone()),
+                                    );
+                                };
+                            }
+                        }
+                    }
+
                     // This will drop the sender which will in turn cause the stream handling
                     // code in io_loop::drive_connection to emit disconnection events
                     self.connections.remove(&connection_id);
                 }
-                _ => {}
+                ConnectionEvent::StateChanged { .. } => {
+                    // StateChanged events are already handled above for conn_listeners.
+                    // Individual connection state changes don't directly map to
+                    // DialerEvent/AcceptorEvent — those are driven by
+                    // HandshakeCompleted and ConnectionFailed events.
+                }
             }
+        }
+
+        // Process dial requests from dialers — dispatch to IO loop
+        for request in dial_requests {
+            tracing::debug!(
+                dialer_id = ?request.dialer_id,
+                url = %request.url,
+                "dispatching dial request to IO loop"
+            );
+
+            // Notify dialer handle of reconnection attempt (if attempt > 0)
+            if let Some(dh) = self.dialer_handles.get(&request.dialer_id) {
+                // We check if this is a retry by looking at the hub's dialer state.
+                // The first dial request (attempt 0) is the initial dial, not a reconnection.
+                if let Some(attempt) = self.hub.dialer_attempt(request.dialer_id)
+                    && attempt > 0
+                {
+                    dh.notify_reconnecting(attempt);
+                }
+            }
+
+            let task = IoLoopTask::EstablishTransport {
+                dialer_id: request.dialer_id,
+                url: request.url,
+            };
+            if self.tx_io.unbounded_send(task).is_err() {
+                tracing::error!("IO loop channel closed, cannot dispatch dial request");
+            }
+        }
+
+        // Process search state updates — forward each update to any registered
+        // `Repo::search` subscribers for the document, mapping the core
+        // `DocSearch` into a `RepoSearchState::Found(handle)` when the document
+        // has transitioned to `Ready`.
+        for (doc_id, search_state) in search_state_updates {
+            let Some(senders) = self.search_state_streams.get_mut(&doc_id) else {
+                continue;
+            };
+            let Some(actor_id) = self.actors.iter().find_map(|(actor_id, actor)| {
+                if actor.doc.document_id() == &doc_id {
+                    Some(*actor_id)
+                } else {
+                    None
+                }
+            }) else {
+                tracing::warn!(?doc_id, "search state update for unknown document");
+                continue;
+            };
+            let state = search::SearchState::from_doc_search(search_state, actor_id, &self.actors);
+            senders.retain(|tx| tx.unbounded_send(state.clone()).is_ok());
+            if senders.is_empty() {
+                self.search_state_streams.remove(&doc_id);
+            }
+        }
+
+        // Process dialer events (dialer lifecycle)
+        for event in dialer_events {
+            match &event {
+                samod_core::DialerEvent::MaxRetriesReached { dialer_id, url } => {
+                    tracing::warn!(
+                        ?dialer_id,
+                        %url,
+                        "dialer exhausted retry budget"
+                    );
+                    if let Some(dh) = self.dialer_handles.get(dialer_id) {
+                        dh.notify_max_retries_reached();
+                    }
+                }
+            }
+        }
+
+        if let Some(ref obs) = self.observer {
+            obs.observe(&observer::RepoEvent::HubEventProcessed {
+                duration: hub_start.elapsed(),
+                event_type,
+                connections: connections_count,
+                documents: documents_count,
+            });
         }
 
         if stopped {
@@ -901,25 +1191,36 @@ impl Inner {
         let doc_id = args.document_id().clone();
         let (actor, init_results) = DocumentActor::new(UnixTimestamp::now(), args);
 
+        if let Some(ref obs) = self.observer {
+            obs.observe(&observer::RepoEvent::DocumentOpened {
+                document_id: doc_id.clone(),
+            });
+        }
+
         let doc_inner = Arc::new(Mutex::new(DocActorInner::new(
             doc_id.clone(),
             actor_id,
             actor,
             self.tx_to_core.clone(),
             self.tx_io.clone(),
+            self.observer.clone(),
         )));
-        let handle = DocHandle::new(doc_id.clone(), doc_inner.clone());
-        self.actors.insert(
-            actor_id,
-            ActorHandle {
-                inner: doc_inner.clone(),
-                doc: handle,
-            },
-        );
-
         match &mut self.doc_runner {
             #[cfg(feature = "threadpool")]
-            DocRunner::Threadpool(_threadpool) => {
+            DocRunner::Threadpool(threadpool) => {
+                let handle = DocHandle::new(
+                    doc_id.clone(),
+                    doc_inner.clone(),
+                    doc_handle::DocTaskDispatcher::Threadpool(threadpool.clone()),
+                );
+                self.actors.insert(
+                    actor_id,
+                    ActorHandle {
+                        inner: doc_inner.clone(),
+                        doc: handle,
+                    },
+                );
+
                 // In threadpool mode, we process init_results synchronously and then
                 // dispatch subsequent tasks via dispatch_task() which spawns them
                 // directly on the threadpool. This avoids dedicating one thread per
@@ -932,7 +1233,20 @@ impl Inner {
             } => {
                 // Create channel for this actor and store the sender
                 let (tx, rx) = unbounded::channel();
-                task_senders.insert(actor_id, tx);
+                task_senders.insert(actor_id, tx.clone());
+
+                let handle = DocHandle::new(
+                    doc_id.clone(),
+                    doc_inner.clone(),
+                    doc_handle::DocTaskDispatcher::Async(tx),
+                );
+                self.actors.insert(
+                    actor_id,
+                    ActorHandle {
+                        inner: doc_inner.clone(),
+                        doc: handle,
+                    },
+                );
 
                 if tx_spawn
                     .unbounded_send(SpawnedActor {
@@ -1014,9 +1328,12 @@ async fn async_actor_runner(rx: UnboundedReceiver<SpawnedActor>) {
 struct TaskSetup {
     peer_id: PeerId,
     inner: Arc<Mutex<Inner>>,
+    tx_io: UnboundedSender<IoLoopTask>,
     rx_storage: UnboundedReceiver<IoLoopTask>,
     rx_from_core: UnboundedReceiver<(DocumentActorId, DocToHubMsg)>,
     rx_actor: Option<UnboundedReceiver<SpawnedActor>>,
+    dialers: Arc<Mutex<HashMap<DialerId, io_loop::DynDialer>>>,
+    observer: Option<Arc<dyn observer::RepoObserver>>,
 }
 
 impl TaskSetup {
@@ -1024,19 +1341,21 @@ impl TaskSetup {
         storage: S,
         peer_id: Option<PeerId>,
         concurrency: ConcurrencyConfig,
+        observer: Option<Arc<dyn observer::RepoObserver>>,
     ) -> TaskSetup {
         let mut rng = rand::rngs::StdRng::from_rng(&mut rand::rng());
         let peer_id = peer_id.unwrap_or_else(|| PeerId::new_with_rng(&mut rng));
         let hub = load_hub(storage.clone(), Hub::load(peer_id.clone())).await;
 
         let (tx_storage, rx_storage) = unbounded::channel();
+        let tx_io_for_tick = tx_storage.clone();
         let (tx_to_core, rx_from_core) = unbounded::channel();
         let rx_actor: Option<UnboundedReceiver<SpawnedActor>>;
         let doc_runner = match concurrency {
             #[cfg(feature = "threadpool")]
             ConcurrencyConfig::Threadpool(threadpool) => {
                 rx_actor = None;
-                DocRunner::Threadpool(threadpool)
+                DocRunner::Threadpool(Arc::new(threadpool))
             }
             ConcurrencyConfig::AsyncRuntime => {
                 let (tx, rx) = unbounded::channel();
@@ -1048,6 +1367,7 @@ impl TaskSetup {
             }
         };
 
+        let dialers = Arc::new(Mutex::new(HashMap::new()));
         let inner = Arc::new(Mutex::new(Inner {
             doc_runner,
             actors: HashMap::new(),
@@ -1060,17 +1380,29 @@ impl TaskSetup {
             waiting_for_connection: HashMap::new(),
             stop_waiters: Vec::new(),
             rng: rand::rngs::StdRng::from_os_rng(),
+            dialers: dialers.clone(),
+            dialer_handles: HashMap::new(),
+            acceptor_handles: HashMap::new(),
+            observer: observer.clone(),
+            search_state_streams: HashMap::new(),
         }));
 
         TaskSetup {
             peer_id,
             inner,
+            tx_io: tx_io_for_tick,
             rx_actor,
             rx_from_core,
             rx_storage,
+            dialers,
+            observer,
         }
     }
-    fn spawn_tasks_local<R: LocalRuntimeHandle, S: LocalStorage, A: LocalAnnouncePolicy>(
+    fn spawn_tasks_local<
+        R: LocalRuntimeHandle + Clone + 'static,
+        S: LocalStorage,
+        A: LocalAnnouncePolicy,
+    >(
         self,
         runtime: R,
         storage: S,
@@ -1083,6 +1415,8 @@ impl TaskSetup {
                 storage,
                 announce_policy,
                 self.rx_storage,
+                self.dialers.clone(),
+                self.observer.clone(),
             )
             .boxed_local(),
         );
@@ -1099,12 +1433,18 @@ impl TaskSetup {
             .instrument(tracing::info_span!("actor_loop", local_peer_id=%peer_id))
             .boxed_local()
         });
+        {
+            let tx_io = self.tx_io.clone();
+            let runtime_for_tick = runtime.clone();
+            let sleep = move |d| runtime_for_tick.sleep(d);
+            runtime.spawn(connector_tick_loop(tx_io, sleep).boxed_local());
+        }
         if let Some(rx_actor) = self.rx_actor {
             runtime.spawn(async_actor_runner(rx_actor).boxed_local());
         }
     }
 
-    fn spawn_tasks<R: RuntimeHandle, S: Storage, A: AnnouncePolicy>(
+    fn spawn_tasks<R: RuntimeHandle + Clone + Send, S: Storage, A: AnnouncePolicy>(
         self,
         runtime: R,
         storage: S,
@@ -1117,6 +1457,8 @@ impl TaskSetup {
                 storage,
                 announce_policy,
                 self.rx_storage,
+                self.dialers.clone(),
+                self.observer.clone(),
             )
             .boxed(),
         );
@@ -1133,8 +1475,33 @@ impl TaskSetup {
             .instrument(tracing::info_span!("actor_loop", local_peer_id=%peer_id))
             .boxed()
         });
+        {
+            let tx_io = self.tx_io.clone();
+            let runtime_for_tick = runtime.clone();
+            let sleep = move |d| runtime_for_tick.sleep(d);
+            runtime.spawn(connector_tick_loop(tx_io, sleep).boxed());
+        }
         if let Some(rx_actor) = self.rx_actor {
             runtime.spawn(async_actor_runner(rx_actor).boxed());
+        }
+    }
+}
+
+/// Periodically sends tick events to the IO loop to drive time-based connector
+/// logic (e.g. retry backoff for dialers).
+///
+/// `sleep` is provided by the runtime so this loop is not coupled to any
+/// specific async runtime.
+async fn connector_tick_loop<F, Fut>(tx_io: UnboundedSender<IoLoopTask>, sleep: F)
+where
+    F: Fn(std::time::Duration) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    loop {
+        sleep(std::time::Duration::from_millis(100)).await;
+        if tx_io.unbounded_send(IoLoopTask::Tick).is_err() {
+            // IO loop channel closed — repo is shutting down
+            break;
         }
     }
 }

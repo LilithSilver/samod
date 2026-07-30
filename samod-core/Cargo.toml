@@ -1,6 +1,6 @@
 [package]
 name = "samod-core"
-version = "0.6.1"
+version = "0.12.3"
 edition = "2024"
 repository = "https://github.com/alexjg/samod"
 authors = ["Alex Good <alex@patternist.xyz>"]
@@ -8,15 +8,16 @@ description = "the core library for the samod automerge-repo implementation"
 license = "MIT"
 
 [dependencies]
-base64 = "0.21"
+base64 = "0.23"
 tracing = "0.1.41"
 uuid = { version = "1.0", features = ["v4", "serde"] }
-rand = "0.9.2"
+rand = "0.10.2"
 automerge = { workspace = true }
 serde = { version = "1.0", features = ["derive"] }
 hex = "0.4"
-minicbor = { version = "1.0.0", features = ["std"] }
+minicbor = { version = "2.3.0", features = ["std"] }
 thiserror = "2.0.12"
+url = "2.5"
 b58 = "0.1.2"
 sha2 = "0.11.0-rc.3"
 

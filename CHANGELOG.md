@@ -1,5 +1,292 @@
 # Changelog
 
+## 0.12.3 - 2026-07-09
+
+### Fixed
+
+* `FileSystemStorage` no longer panics if the filesystem is not shaped the way
+  it expects.
+
+## 0.12.2 - 2026-07-08
+
+### Added
+
+* Added `DocHandle::with_document_async` which does two things:
+  a) Does not block the current task waiting to acquire the underlying document
+    mutex
+  b) In threadpool mode runs the closure on the threadpool so that slow
+     automerge operations don't block the calling task
+
+## 0.12.1 - 2026-06-22
+
+### Changed
+
+* `DocHandle::{changes, ephemeral}` now return streams with a `'static`
+   lifetime
+
+> [!NOTE]
+> This is the changelog for the `samod` crate. For the `samod-core` crate look
+> in `./samod-core/CHANGELOG.md`
+
+## 0.12.0 - 2026-06-05
+
+### Breaking Changes
+
+* Updated to `automerge@0.10.0`.
+
+## 0.11.0 - 2026-06-04
+
+### Breaking Changes
+
+The only breaking change here is that the `samod-core` crate has updated to
+0.11.0. This doesn't change the API for `samod` really but we do re-export
+some `samod-core` types and so it is a breaking change.
+
+### Added
+
+* Added `Repo::search`, which returns an initial `SearchState` and a stream of
+  subsequent search state updates for a document lookup. This lets applications
+  distinguish between loading from storage, requesting from peers, currently
+  unavailable, and found states. Importantly `Repo::search` continues notifying
+  even if the document is not found so that you can wait until someone does
+  have it (e.g. if you are waiting for a network connection to come up).
+* Added `SearchState` and peer request status reporting so callers can inspect
+  which connected peers have been requested, are syncing, are unavailable, or
+  have the document available.
+
+### Changed
+
+* `Repo::find` is now implemented as a convenience wrapper around `Repo::search`.
+  Its public API remains unchanged.
+
+### Fixed
+
+* Fixed a regression where `Repo::find` could hang instead of returning
+  `Ok(None)` after connected peers reported that a document was unavailable.
+
+## 0.10.0 - 2026-05-15
+
+### Breaking Changes
+
+* Updated to `automerge@0.9.0`
+
+### Fixed
+
+* A bug which causes sync time to increase exponentially with the total number
+  of connections since samod started
+
+## 0.9.0 - 2026-03-25
+
+### Breaking Changes
+
+* Updated to `automerge@0.8.0`
+
+### Fixed
+
+* A bug where locally unavailable documents sent by peers with an announce
+  policy set to false would be marked as unavailable
+
+### Added
+
+* `TcpDialer::new` which takes a `Url` parameter, rather than a host and a port
+  or a socket address.
+* `Repo::dial_tcp()` to simplify construction of `TcpDialer`. 
+* Allow documents syncing over the TCP transport to be up to 8gb size instead
+  of Tokio's default 8mb frame size
+* Exposed receiving `ConnectionHandle`s via `accept()`. Users can now subscribe
+  to an `events()` stream directly on the handle, or `await` for
+  `handshake_completed()`.
+
+## 0.8.0 - 2026-03-06
+
+The main focus of this release is a new connection management API which
+replaces the `Repo::connect` method with separate APIs for making outgoing
+connections (referred to as a "dialer") and accepting incoming connections
+(an "acceptor"). The payoff is that we can automatically handle reconnection.
+
+A second, smaller feature is the addition of a `RepoObserver` to help with
+monitoring running `samod` processes.
+
+What follows is a quick guide to the new connections API; for more details on
+breaking changes and other added features, see the "Added" and "Breaking
+Changes" sections which follow the guide.
+
+### Updating to the New Connection API
+
+#### Outgoing connections (previously `Repo::connect(..., ConnDirection::Outgoing)`)
+
+```rust
+// Before
+let conn = repo.connect(rx, tx, ConnDirection::Outgoing).unwrap();
+conn.handshake_complete().await.unwrap();
+
+// After
+let handle = repo.dial(BackoffConfig::default(), Arc::new(my_dialer)).unwrap();
+
+// or, for WebSocket URLs directly:
+let handle = repo.dial_websocket(url, BackoffConfig::default()).unwrap();
+```
+
+#### Incoming connections (previously `Repo::connect(..., ConnDirection::Incoming)`)
+
+```rust
+// Before
+let conn = repo.connect(rx, tx, ConnDirection::Incoming).unwrap();
+
+// After — set up an acceptor once, then hand transports to it as they arrive:
+let acceptor = repo.make_acceptor(url).unwrap();
+
+// From arbitrary streams/sinks:
+acceptor.accept(Transport::new(rx_stream, tx_sink)).unwrap();
+
+// From an axum WebSocket upgrade handler:
+acceptor.accept_axum(socket).unwrap();
+
+// From a raw tungstenite stream:
+acceptor.accept_tungstenite(ws_stream).unwrap();
+```
+
+#### Observing connection events
+
+```rust
+// Dialer side — wait for the first successful connection:
+let peer_info = handle.established().await?;
+
+// Dialer side — stream every lifecycle event:
+let mut events = handle.events();
+while let Some(event) = events.next().await {
+    match event {
+        DialerEvent::Connected { peer_info } => { /* … */ }
+        DialerEvent::Disconnected             => { /* … */ }
+        DialerEvent::Reconnecting { attempt } => { /* … */ }
+        DialerEvent::MaxRetriesReached        => { break; }
+    }
+}
+
+// Acceptor side — react to clients connecting/disconnecting:
+let mut events = acceptor.events();
+while let Some(event) = events.next().await {
+    match event {
+        AcceptorEvent::ClientConnected    { connection_id, peer_info } => { /* … */ }
+        AcceptorEvent::ClientDisconnected { connection_id }            => { /* … */ }
+    }
+}
+```
+
+#### Implementing a custom `Dialer`
+
+```rust
+use samod::{Dialer, Transport};
+use url::Url;
+use std::pin::Pin;
+
+struct MyDialer { url: Url }
+
+impl Dialer for MyDialer {
+    fn url(&self) -> Url { self.url.clone() }
+
+    fn connect(&self) -> Pin<Box<dyn Future<Output = Result<Transport, Box<dyn std::error::Error + Send + Sync>>> + Send>> {
+        Box::pin(async move {
+            // establish your transport here, then wrap it:
+            Ok(Transport::new(my_rx_stream, my_tx_sink))
+        })
+    }
+}
+```
+
+#### Implementing `RuntimeHandle::sleep`
+
+If you have a custom `RuntimeHandle`, add the new required method:
+
+```rust
+fn sleep(&self, duration: Duration) -> impl Future<Output = ()> + Send {
+    tokio::time::sleep(duration) // or your runtime's equivalent
+}
+```
+
+### Added
+
+* `Repo::dial` — initiates an outgoing connection using a user-supplied
+  `Dialer` implementation. Returns a `DialerHandle` immediately (non-blocking).
+  The `DialerHandle` can be used to monitor the connection.
+* `Repo::dial_websocket` — convenience wrapper around `Repo::dial` for
+  WebSocket connections; takes a `Url` and `BackoffConfig`.
+* `Repo::acceptor` — registers a URL as a listening address and returns an
+  `AcceptorHandle` for accepting incoming connections on that URL.
+* `Transport` — a type-erased `(Stream, Sink)` pair returned by `Dialer::connect`
+  and accepted by `AcceptorHandle::accept`.
+* `RuntimeHandle::sleep` — required new method on the `RuntimeHandle` trait;
+  must return a future that completes after the given `Duration`. This powers
+  back-off delays inside the reconnection logic.
+* `samod::NeverAnnounce`, an `AnnouncePolicy` which never announces any documents
+  to peers
+* Add the `native-tls` feature to `tungstenite` and `tokio-tungstenite` when the
+  `tungstenite` feature is enabled. This allows using TLS with WebSocket 
+  dialers.
+* The `samod::tokio_io` module which contains `TcpDialer` for connecting to 
+  servers over TCP and `AcceptorHandle::accetp_tokio_io` which implements
+  the receiving end
+* `samod::RepoObserver` which is notified of events occurring in the `Repo`
+  which may be of interest for monitoring (e.g. for producing throughput
+  statistics on sync message processing)
+
+### Fixed
+
+* A bug where requests which were forwarded across peers who were configured
+  to not announce documents would fail to resolve on the original requestor
+* Some interoperability bugs with the JS implementation
+* A bug where if a connection failed during establishment the io loop would
+  crash, causing the whole repo to stop working
+
+### Breaking Changes
+
+* **`Repo::connect` / `Connection` removed.** The old unified `connect` method
+  and the `Connection` / `ConnDirection` types have been removed entirely.
+  Use `Repo::dial` (outgoing) and `Repo::acceptor` + `AcceptorHandle::accept`
+  (incoming) instead.
+* **`RuntimeHandle::sleep` is now required.** Any custom `RuntimeHandle`
+  implementation must add a `sleep(duration: Duration) -> impl Future` method.
+* **`Repo::connect_tungstenite` / `Repo::accept_axum` / `Repo::accept_tungstenite`
+  moved to `AcceptorHandle`.** Call `acceptor.accept_axum(socket)` /
+  `acceptor.accept_tungstenite(ws)` instead of the repo directly.
+* **`Repo::when_connected` removed.** Replace calls like
+  `repo.when_connected(peer_id).await` with `dialer_handle.established().await`
+  (dialer side) or listening on `acceptor.events()` for
+  `AcceptorEvent::ClientConnected` (acceptor side). Connection IDs are now
+  obtained from those futures/events rather than from `when_connected`.
+* **`load_local` replaces `load` on `LocalPool` repos.** `RepoBuilder::load_local()`
+  must be used instead of `RepoBuilder::load()` when building a repo for a
+  `futures::executor::LocalPool` runtime.
+
+
+## samod-core: 0.7.1 - 2026-01-13
+
+### Added
+
+* Added `DocumentActor::begin_modification` method for modification patterns
+  which can't be expressed using a callback
+
+## 0.7.1 - 2026-01-08
+
+### Fixed
+
+* There was a bug where document larger than 8Mb wouldn't sync due to a size
+  limit in the length delimited codec used in `Repo::connect_tokio_io`. This
+  has been fixed by increasing the limit
+
+## 0.7.0 - 2026-01-07
+
+### Breaking Changes
+
+* `Repo::connected_peers` now returns a stream of changes to the connected
+  peers, as well as the currently connected peers. This makes it possible to
+  track changes to connected peers consistently
+
+### Fixed
+
+* Fixed a deadlock when using ConcurrencyConfig::Threadpool and loading more
+  documents than threads in the pool
+
 ## 0.6.1 - 2025-12-08
 
 ### Added

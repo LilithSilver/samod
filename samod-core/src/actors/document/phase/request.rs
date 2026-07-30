@@ -1,10 +1,15 @@
 use std::collections::HashMap;
+use std::time::Duration;
 
 use automerge::{Automerge, ChangeHash, ReadDoc, sync};
 
-use crate::{ConnectionId, DocumentId, UnixTimestamp, actors::messages::SyncMessage};
-
-use super::peer_doc_connection::{AnnouncePolicy, PeerDocConnection};
+use crate::{
+    ConnectionId, DocumentId, PeerRequestState, UnixTimestamp,
+    actors::{
+        document::peer_doc_connection::{AnnouncePolicy, PeerDocConnection},
+        messages::SyncMessage,
+    },
+};
 
 #[derive(Debug)]
 pub(crate) struct Request {
@@ -21,7 +26,7 @@ struct Peer {
 #[derive(Debug)]
 enum PeerState {
     Requesting(Requesting),
-    RequestedFromUs,
+    RequestedFromUs { unavailable_response_sent: bool },
     Unavailable,
     Syncing { their_heads: Vec<ChangeHash> },
 }
@@ -44,9 +49,15 @@ impl From<AnnouncePolicy> for Requesting {
     }
 }
 
-pub(crate) struct RequestState {
-    pub(crate) finished: bool,
-    pub(crate) found: bool,
+/// Outcome of checking request status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RequestOutcome {
+    /// Still searching, peers are being queried
+    Searching,
+    /// Document found and synced
+    Found,
+    /// All peers exhausted, no document found (but still in Requesting phase)
+    Exhausted,
 }
 
 impl Request {
@@ -88,118 +99,61 @@ impl Request {
         doc: &mut Automerge,
         conn: &mut PeerDocConnection,
         msg: SyncMessage,
-    ) {
+    ) -> Option<Duration> {
         let Some(peer) = self.peer_states.get_mut(&conn.connection_id) else {
             tracing::warn!(connection_id=?conn.connection_id, "received message for unknown connection");
-            return;
+            return None;
         };
         match (msg, &mut peer.state) {
             (SyncMessage::Request { .. }, PeerState::Requesting { .. }) => {
-                peer.state = PeerState::RequestedFromUs;
+                peer.state = PeerState::RequestedFromUs {
+                    unavailable_response_sent: false,
+                };
+                None
             }
-            (SyncMessage::Request { .. }, PeerState::RequestedFromUs) => {
-                // nothing to do
-            }
-            (SyncMessage::Request { .. }, PeerState::Unavailable) => {
-                // Nothing to do, they're already unavailable
-            }
+            (SyncMessage::Request { .. }, PeerState::RequestedFromUs { .. }) => None,
+            (SyncMessage::Request { .. }, PeerState::Unavailable) => None,
             (SyncMessage::Request { .. }, PeerState::Syncing { .. }) => {
                 // This is weird, they sent us a request whilst we're syncing with them. Maybe
-                // they restarted? Eithe way, mark them as unavailable
+                // they restarted? Either way, mark them as unavailable
                 peer.state = PeerState::Unavailable;
+                None
             }
             (SyncMessage::Sync { data }, PeerState::Requesting { .. }) => {
-                // They have the document, start syncing it
-                let sync_msg = match sync::Message::decode(&data) {
-                    Ok(msg) => msg,
-                    Err(e) => {
-                        tracing::warn!(
-                            connection_id=?conn.connection_id, err=?e,
-                            "failed to decode sync message, marking peer as unavailable"
-                        );
-                        peer.state = PeerState::Unavailable;
-                        return;
-                    }
-                };
-                if let Err(e) = conn.receive_sync_message(now, doc, sync_msg) {
-                    tracing::warn!(
-                        connection_id=?conn.connection_id, err=?e,
-                        "failed to apply sync message, marking peer as unavailable"
-                    );
-                    peer.state = PeerState::Unavailable;
-                    return;
-                }
-
+                let duration = apply_sync_data(now, doc, conn, peer, &data)?;
                 let their_heads = conn.their_heads().unwrap_or_default();
                 if their_heads.is_empty() {
                     tracing::trace!("their heads are empty, transitioning to unavailable");
-                    // If they have no heads, we can consider them unavailable
                     peer.state = PeerState::Unavailable;
                 } else {
-                    // Otherwise, we can start syncing with them
                     tracing::info!(connection_id=?conn.connection_id, "starting sync with peer");
                     peer.state = PeerState::Syncing { their_heads };
                 }
+                Some(duration)
             }
-            (SyncMessage::Sync { data }, PeerState::Unavailable | PeerState::RequestedFromUs) => {
-                // Weird, they said this wasn't available, but they have it now so oh well
-                let sync_msg = match sync::Message::decode(&data) {
-                    Ok(msg) => msg,
-                    Err(e) => {
-                        tracing::warn!(
-                            connection_id=?conn.connection_id, err=?e,
-                            "failed to decode sync message, marking peer as unavailable"
-                        );
-                        peer.state = PeerState::Unavailable;
-                        return;
-                    }
-                };
-                if let Err(e) = conn.receive_sync_message(now, doc, sync_msg) {
-                    tracing::warn!(
-                        connection_id=?conn.connection_id, err=?e,
-                        "failed to apply sync message, marking peer as unavailable"
-                    );
-                    peer.state = PeerState::Unavailable;
-                    return;
-                }
-
+            (
+                SyncMessage::Sync { data },
+                PeerState::Unavailable | PeerState::RequestedFromUs { .. },
+            ) => {
+                let duration = apply_sync_data(now, doc, conn, peer, &data)?;
                 let their_heads = conn.their_heads().unwrap_or_default();
                 peer.state = PeerState::Syncing { their_heads };
+                Some(duration)
             }
             (SyncMessage::Sync { data }, PeerState::Syncing { .. }) => {
-                // They sent us a sync message while we were syncing, so we can just
-                // apply it to our existing state
-                let sync_msg = match sync::Message::decode(&data) {
-                    Ok(msg) => msg,
-                    Err(e) => {
-                        tracing::warn!(
-                            connection_id=?conn.connection_id, err=?e,
-                            "failed to decode sync message, marking peer as unavailable"
-                        );
-                        peer.state = PeerState::Unavailable;
-                        return;
-                    }
-                };
-                if let Err(e) = conn.receive_sync_message(now, doc, sync_msg) {
-                    tracing::warn!(
-                        connection_id=?conn.connection_id, err=?e,
-                        "failed to apply sync message, marking peer as unavailable"
-                    );
-                    peer.state = PeerState::Unavailable;
-                }
+                apply_sync_data(now, doc, conn, peer, &data)
             }
             (
                 SyncMessage::DocUnavailable,
-                PeerState::Requesting { .. } | PeerState::RequestedFromUs,
+                PeerState::Requesting { .. } | PeerState::RequestedFromUs { .. },
             ) => {
                 peer.state = PeerState::Unavailable;
+                None
             }
-            (SyncMessage::DocUnavailable, PeerState::Unavailable) => {
-                // Nothing to do, they're already unavailable
-            }
+            (SyncMessage::DocUnavailable, PeerState::Unavailable) => None,
             (SyncMessage::DocUnavailable, PeerState::Syncing { .. }) => {
-                // weird, they must have lost the doc somehow. Oh well
                 peer.state = PeerState::Unavailable;
+                None
             }
         }
     }
@@ -209,7 +163,7 @@ impl Request {
         now: UnixTimestamp,
         doc: &Automerge,
         conn: &mut PeerDocConnection,
-    ) -> Option<SyncMessage> {
+    ) -> Option<(SyncMessage, Duration)> {
         let any_peer_is_syncing = self
             .peer_states
             .values()
@@ -239,53 +193,65 @@ impl Request {
                 conn.reset_sync_state();
                 *requesting = Requesting::Sent;
                 conn.generate_sync_message(now, doc)
-                    .map(|msg| SyncMessage::Request { data: msg.encode() })
+                    .map(|(msg, duration)| (SyncMessage::Request { data: msg.encode() }, duration))
             }
             PeerState::Syncing { .. } => conn
                 .generate_sync_message(now, doc)
-                .map(|msg| SyncMessage::Sync { data: msg.encode() }),
-            PeerState::Unavailable | PeerState::RequestedFromUs => None,
+                .map(|(msg, duration)| (SyncMessage::Sync { data: msg.encode() }, duration)),
+            PeerState::Unavailable => None,
+            PeerState::RequestedFromUs {
+                unavailable_response_sent,
+            } => {
+                if *unavailable_response_sent {
+                    None
+                } else {
+                    *unavailable_response_sent = true;
+                    Some((SyncMessage::DocUnavailable, Duration::default()))
+                }
+            }
         }
     }
 
-    pub(crate) fn status(&self, doc: &Automerge) -> RequestState {
-        if tracing::enabled!(tracing::Level::TRACE) {
-            tracing::trace!(?self.peer_states, "checking if request is done");
-        }
-        let all_unavailable = self.peer_states.values().all(|peer| {
+    pub(crate) fn outcome(&self, doc: &Automerge) -> RequestOutcome {
+        let all_peers_unavailable = self.peer_states.values().all(|peer| {
             matches!(
                 peer.state,
                 PeerState::Unavailable
-                    | PeerState::RequestedFromUs
+                    | PeerState::RequestedFromUs { .. }
                     | PeerState::Requesting(Requesting::NotSentDueToAnnouncePolicy)
             )
         });
-        if all_unavailable {
-            tracing::debug!("All peers are unavailable, sync complete");
-        }
 
         let any_sync_is_done = self.peer_states.values().any(|peer| {
-            matches!(&peer.state, PeerState::Syncing { their_heads } if their_heads.iter().all(|head| doc.get_change_by_hash(head).is_some()))
+            matches!(&peer.state, PeerState::Syncing { their_heads }
+                if their_heads.iter().all(|head| doc.get_change_by_hash(head).is_some()))
         });
+
         if any_sync_is_done {
-            tracing::debug!("At least one peer has completed syncing, sync complete");
-        }
-
-        tracing::trace!(?all_unavailable, ?any_sync_is_done, "request status check");
-
-        RequestState {
-            finished: all_unavailable || any_sync_is_done,
-            found: (!all_unavailable) && any_sync_is_done,
+            RequestOutcome::Found
+        } else if all_peers_unavailable && !self.peer_states.is_empty() {
+            RequestOutcome::Exhausted
+        } else {
+            RequestOutcome::Searching
         }
     }
 
-    pub(crate) fn peers_waiting_for_us_to_respond(&self) -> impl Iterator<Item = ConnectionId> {
+    /// Expose per-peer states for building status updates.
+    /// Returns (connection_id, state) for each peer we're tracking.
+    pub(crate) fn peer_states(&self) -> HashMap<ConnectionId, PeerRequestState> {
         self.peer_states
             .iter()
-            .filter_map(|(conn_id, peer)| match peer.state {
-                PeerState::RequestedFromUs => Some(*conn_id),
-                _ => None,
+            .map(|(conn_id, peer)| {
+                let state = match &peer.state {
+                    PeerState::Requesting(_) | PeerState::RequestedFromUs { .. } => {
+                        PeerRequestState::Requested
+                    }
+                    PeerState::Unavailable => PeerRequestState::Unavailable,
+                    PeerState::Syncing { .. } => PeerRequestState::Syncing,
+                };
+                (*conn_id, state)
             })
+            .collect()
     }
 
     pub(crate) fn announce_policy_changed(&mut self, peer: ConnectionId, policy: AnnouncePolicy) {
@@ -303,13 +269,45 @@ impl Request {
                     }
                     _ => {}
                 },
-                Requesting::NotSentDueToAnnouncePolicy => {
-                    if policy == AnnouncePolicy::Announce {
-                        peer.state = PeerState::Requesting(Requesting::AwaitingSend);
-                    }
+                Requesting::NotSentDueToAnnouncePolicy if policy == AnnouncePolicy::Announce => {
+                    peer.state = PeerState::Requesting(Requesting::AwaitingSend);
                 }
                 _ => {}
             }
+        }
+    }
+}
+
+/// Decode and apply sync data to a peer connection, returning the duration
+/// of the automerge operation. Returns `None` if decoding or application
+/// fails (the peer is marked as unavailable in that case).
+fn apply_sync_data(
+    now: UnixTimestamp,
+    doc: &mut Automerge,
+    conn: &mut PeerDocConnection,
+    peer: &mut Peer,
+    data: &[u8],
+) -> Option<Duration> {
+    let sync_msg = match sync::Message::decode(data) {
+        Ok(msg) => msg,
+        Err(e) => {
+            tracing::warn!(
+                connection_id=?conn.connection_id, err=?e,
+                "failed to decode sync message, marking peer as unavailable"
+            );
+            peer.state = PeerState::Unavailable;
+            return None;
+        }
+    };
+    match conn.receive_sync_message(now, doc, sync_msg) {
+        Ok(duration) => Some(duration),
+        Err(e) => {
+            tracing::warn!(
+                connection_id=?conn.connection_id, err=?e,
+                "failed to apply sync message, marking peer as unavailable"
+            );
+            peer.state = PeerState::Unavailable;
+            None
         }
     }
 }
