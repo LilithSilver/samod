@@ -1,6 +1,10 @@
+#[cfg(feature = "tungstenite")]
+use axum::http::{self, HeaderValue};
 #[cfg(any(feature = "tungstenite", feature = "axum"))]
 use futures::TryStreamExt;
 use futures::{Sink, SinkExt, Stream, StreamExt};
+#[cfg(feature = "tungstenite")]
+use tungstenite::client::IntoClientRequest;
 
 use crate::Repo;
 #[cfg(any(feature = "tungstenite", feature = "axum"))]
@@ -154,13 +158,14 @@ impl std::error::Error for NetworkError {}
 #[cfg(feature = "tungstenite")]
 pub struct TungsteniteDialer {
     url: Url,
+    bearer_token: Option<String>,
 }
 
 #[cfg(feature = "tungstenite")]
 impl TungsteniteDialer {
     /// Create a new `TungsteniteDialer` for the given URL.
-    pub fn new(url: Url) -> Self {
-        Self { url }
+    pub fn new(url: Url, bearer_token: Option<String>) -> Self {
+        Self { url, bearer_token }
     }
 }
 
@@ -183,8 +188,18 @@ impl crate::Dialer for TungsteniteDialer {
         >,
     > {
         let url = self.url.clone();
+        let token = self.bearer_token.clone();
         Box::pin(async move {
-            let (ws, _response) = tokio_tungstenite::connect_async(url.as_str()).await?;
+            let mut request = url.as_str().into_client_request()?;
+
+            if let Some(token) = token {
+                request.headers_mut().insert(
+                    http::header::AUTHORIZATION,
+                    HeaderValue::from_str(&format!("Bearer {}", token))?,
+                );
+            }
+
+            let (ws, _response) = tokio_tungstenite::connect_async(request).await?;
 
             // Wrap tungstenite errors into NetworkError
             let ws = ws
@@ -225,7 +240,7 @@ impl Repo {
         url: Url,
         backoff: crate::BackoffConfig,
     ) -> Result<crate::DialerHandle, crate::Stopped> {
-        let dialer = Arc::new(TungsteniteDialer::new(url));
+        let dialer = Arc::new(TungsteniteDialer::new(url, None));
         self.dial(backoff, dialer)
     }
 }
