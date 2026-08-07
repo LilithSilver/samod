@@ -1,5 +1,3 @@
-#[cfg(feature = "tungstenite")]
-use axum::http::{self, HeaderValue};
 #[cfg(any(feature = "tungstenite", feature = "axum"))]
 use futures::TryStreamExt;
 use futures::{Sink, SinkExt, Stream, StreamExt};
@@ -194,8 +192,8 @@ impl crate::Dialer for TungsteniteDialer {
 
             if let Some(token) = token {
                 request.headers_mut().insert(
-                    http::header::AUTHORIZATION,
-                    HeaderValue::from_str(&format!("Bearer {}", token))?,
+                    tungstenite::http::header::AUTHORIZATION,
+                    tungstenite::http::HeaderValue::from_str(&format!("Bearer {}", token))?,
                 );
             }
 
